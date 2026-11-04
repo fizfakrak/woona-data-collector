@@ -58,6 +58,8 @@ import com.example.myapplication.ble.BleTransportProfile
 import com.example.myapplication.feature.device.ChartWindowPreset
 import com.example.myapplication.feature.device.DeviceScreenEntryPoint
 import com.example.myapplication.feature.device.DeviceUiState
+import com.example.myapplication.feature.device.V2StorageScreen
+import com.example.myapplication.feature.device.V2StorageUiState
 import com.example.myapplication.feature.device.ExportPhase
 import com.example.myapplication.localization.AppLanguage
 import com.example.myapplication.localization.appStringResource
@@ -140,6 +142,7 @@ fun DeviceAppShell(
     }
     var isExportSheetVisible by rememberSaveable { mutableStateOf(false) }
     var showSessionCharts by rememberSaveable { mutableStateOf(false) }
+    var showSessionStorage by rememberSaveable { mutableStateOf(false) }
     val selectedDestination = AppDestination.entries.firstOrNull { it.name == selectedDestinationName } ?: AppDestination.ANIMALS
     val canExportAnyFile = (canShareAllFiles || canSharePacketFile || canShareCsvFile || canShareRawFile || canShareLogFile) && uiState.exportPhase == null
 
@@ -205,11 +208,26 @@ fun DeviceAppShell(
                     }
                     AppDestination.SESSION -> Column(modifier = Modifier.fillMaxSize()) {
                         Row(modifier = Modifier.padding(horizontal = 12.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            FilterChip(selected = !showSessionCharts, onClick = { showSessionCharts = false }, label = { Text(appStringResource(R.string.nav_session)) }, modifier = Modifier.testTag("session.summary"))
-                            FilterChip(selected = showSessionCharts, onClick = { showSessionCharts = true }, label = { Text(appStringResource(R.string.nav_charts)) }, modifier = Modifier.testTag("session.charts"))
+                            FilterChip(selected = !showSessionCharts && !showSessionStorage, onClick = { showSessionCharts = false; showSessionStorage = false }, label = { Text(appStringResource(R.string.nav_session)) }, modifier = Modifier.testTag("session.summary"))
+                            FilterChip(selected = showSessionCharts && !showSessionStorage, onClick = { showSessionCharts = true; showSessionStorage = false }, label = { Text(appStringResource(R.string.nav_charts)) }, modifier = Modifier.testTag("session.charts"))
+                            FilterChip(selected = showSessionStorage, onClick = { showSessionStorage = true; showSessionCharts = false }, label = { Text(if (selectedLanguage == AppLanguage.RUSSIAN) "SD-карта" else "SD card") }, modifier = Modifier.testTag("session.storage"))
                         }
                         Box(modifier = Modifier.weight(1f)) {
-                        if (!showSessionCharts) DeviceScreenEntryPoint.Overview(
+                        if (showSessionStorage) {
+                            V2StorageScreen(
+                                state = V2StorageUiState(
+                                    connected = uiState.isConnected,
+                                    v2Ready = uiState.v2Ready,
+                                    storageSupported = (uiState.v2Capabilities and
+                                        ((1L shl 7) or (1L shl 8))) ==
+                                        ((1L shl 7) or (1L shl 8)),
+                                    busy = uiState.v2DeviceSessionMode != 0,
+                                ),
+                                language = selectedLanguage,
+                                // Commands intentionally unavailable until feature controller,
+                                // durable record writer and server ACK path are wired.
+                            )
+                        } else if (!showSessionCharts) DeviceScreenEntryPoint.Overview(
                             uiState = uiState.copy(errorMessage = null),
                             onStartScan = onStartScan,
                             onConnect = onConnect,
