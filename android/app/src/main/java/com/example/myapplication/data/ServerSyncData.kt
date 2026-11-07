@@ -265,6 +265,7 @@ fun WoonaDatabase.pendingRecordingIds(): List<String> =
         JOIN server_sync_state s ON s.recording_id=r.id
         WHERE r.status IN ('completed','failed','interrupted')
           AND s.state IN ('pending','retryable_error')
+          AND NOT (r.protocol_version='v2-storage' AND r.questionnaire_validation_state='legacy_incomplete')
           AND (r.remote_copy=0 OR s.server_receipt_sha256 IS NOT NULL)
           AND NOT EXISTS (
               SELECT 1 FROM artifacts a
@@ -660,9 +661,12 @@ fun WoonaDatabase.serverSyncCounts(): ServerSyncCounts =
     readableDatabase.rawQuery(
         """
         WITH sync_items AS (
-          SELECT state,last_error_code,last_error_message,updated_at_utc FROM server_sync_state
+          SELECT 'recording' AS item_kind,s.recording_id AS item_id,s.state,s.last_error_code,s.last_error_message,s.updated_at_utc
+          FROM server_sync_state s
+          JOIN recordings r ON r.id=s.recording_id
+          WHERE NOT (r.protocol_version='v2-storage' AND r.questionnaire_validation_state='legacy_incomplete')
           UNION ALL
-          SELECT server_sync_state,last_error_code,last_error_message,client_created_at_utc
+          SELECT 'profile' AS item_kind,id AS item_id,server_sync_state,last_error_code,last_error_message,client_created_at_utc
           FROM dog_profile_versions
         )
         SELECT
@@ -670,7 +674,7 @@ fun WoonaDatabase.serverSyncCounts(): ServerSyncCounts =
           SUM(CASE WHEN state='uploading' THEN 1 ELSE 0 END),
           SUM(CASE WHEN state='synced' THEN 1 ELSE 0 END),
           SUM(CASE WHEN state IN ('retryable_error','permanent_error') THEN 1 ELSE 0 END),
-          (SELECT COALESCE(NULLIF(last_error_message,''),last_error_code)
+          (SELECT item_kind || ' ' || item_id || ': ' || COALESCE(NULLIF(last_error_message,''),last_error_code)
            FROM sync_items
            WHERE state IN ('retryable_error','permanent_error')
            ORDER BY updated_at_utc DESC LIMIT 1)

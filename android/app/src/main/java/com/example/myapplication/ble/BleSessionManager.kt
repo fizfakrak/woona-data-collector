@@ -22,6 +22,10 @@ import android.util.Log
 import androidx.core.content.ContextCompat
 import com.example.myapplication.R
 import com.example.myapplication.localization.AppTextResolver
+import com.example.myapplication.protocol.V2Frame
+import com.example.myapplication.protocol.WoonaV2Codec
+import com.example.myapplication.protocol.WoonaV2StorageCodec
+import com.example.myapplication.protocol.WoonaV2TimeSync
 import com.example.myapplication.protocol.WoonaV2Discovery
 import com.example.myapplication.protocol.WoonaV2LiveSession
 import com.example.myapplication.protocol.WoonaV2StreamDecoder
@@ -49,6 +53,12 @@ interface BleSessionListener {
     /** Fully validated frame, still containing original LE sample bytes. */
     fun onV2LiveSamples(event: WoonaV2LiveSession.Event.Samples) = Unit
     fun onV2LiveStopped(sessionId: Long) = Unit
+    fun onV2StorageFrame(frame: V2Frame) = Unit
+    fun onV2StorageFailure(reason: String) = Unit
+    fun onV2TimeSyncStatus(status: WoonaV2TimeSync.Diagnostics) = Unit
+    fun onV2SdCaptureStarted(sessionId: Long, storageSeq: Long, streamMask: Long, durationSeconds: Int) = Unit
+    fun onV2SdCaptureStopped(sessionId: Long, storageSeq: Long) = Unit
+    fun onV2SdCaptureFailure(message: String) = Unit
     fun onStateChanged(state: BleSessionState)
     fun onError(message: String, throwable: Throwable? = null)
 }
@@ -70,6 +80,10 @@ interface BleSessionController {
     /** Only after explicit discovery, never during an ordinary Legacy capture. */
     fun startV2Live(streamMask: Long): Boolean = false
     fun stopV2Live(): Boolean = false
+    fun sendV2StorageCommand(type: Int, payload: ByteArray): Boolean = false
+    fun beginV2TimeSync(): Boolean = false
+    fun startV2SdCapture(streamMask: Long, durationSeconds: Int): Boolean = false
+    fun stopV2SdCapture(): Boolean = false
     fun setCaptureActive(active: Boolean) = Unit
     fun disconnect()
     fun close()
@@ -95,6 +109,31 @@ class BleSessionManager(
     private var v2Live: WoonaV2LiveSession? = null
     private var v2LiveReceiver: WoonaV2StreamDecoder? = null
     private var v2SupportsLive = false
+    private var v2SupportsStorage = false
+    private var v2SupportsTimeSync = false
+    private enum class V2SdPhase { IDLE, WAIT_START, RECORDING, WAIT_STOP }
+    private var v2SdPhase = V2SdPhase.IDLE
+    private var v2SdPendingId = 0L
+    private var v2SdExpectedType = 0
+    private var v2SdSessionId = 0L
+    private var v2SdSessionSeq = 0L
+    private var v2SdStreamMask = 0L
+    private var v2SdDurationSeconds = 0
+    private var v2SdAckTimeout: Runnable? = null
+    private var v2SdAutoStop: Runnable? = null
+    private var v2TimeSyncActive = false
+    private var v2TimeSyncPendingId = 0L
+    private var v2TimeSyncNonce = 0L
+    private var v2TimeSyncT1Ns = 0L
+    private var v2TimeSyncSamples = mutableListOf<WoonaV2TimeSync.Sample>()
+    private var v2TimeSyncTimeout: Runnable? = null
+    private var v2StorageRequestId = 0L
+    private var v2StorageExpectedResponse = 0
+    private var v2StorageTransferActive = false
+    private var v2StorageTimeoutRunnable: Runnable? = null
+    private var v2StoragePendingWire = ByteArray(0)
+    private var v2StorageRetryCount = 0
+    private val v2StorageEarlyFrames = ArrayDeque<V2Frame>()
     private var v2WriteCharacteristic: BluetoothGattCharacteristic? = null
     @Volatile private var v2Requested = false
     @Volatile private var v2ConnectionIntent = false
@@ -115,6 +154,227 @@ class BleSessionManager(
     private fun cancelV2ChunkTimeout() {
         v2ChunkTimeoutRunnable?.let(scanHandler::removeCallbacks)
         v2ChunkTimeoutRunnable = null
+    }
+
+    @Synchronized
+    private fun cancelV2SdAckTimeout() {
+        v2SdAckTimeout?.let(scanHandler::removeCallbacks)
+        v2SdAckTimeout = null
+    }
+
+    private fun cancelV2SdAutoStop() {
+        v2SdAutoStop?.let(scanHandler::removeCallbacks)
+        v2SdAutoStop = null
+    }
+
+    private fun scheduleV2SdAutoStop() {
+        cancelV2SdAutoStop()
+        val seq = v2SdSessionSeq
+        var retries = 0
+        lateinit var task: Runnable
+        task = Runnable { synchronized(this) {
+            if (v2SdAutoStop !== task || v2SdSessionSeq != seq) return@synchronized
+            if (v2SdPhase == V2SdPhase.WAIT_STOP || v2SdPhase == V2SdPhase.IDLE) {
+                v2SdAutoStop = null
+                return@synchronized
+            }
+            if (v2SdPhase != V2SdPhase.RECORDING) return@synchronized
+            v2SdAutoStop = null
+            if (!stopV2SdCapture()) {
+                if (++retries <= 40 && v2SdPhase == V2SdPhase.RECORDING) {
+                    // A control/GATT write can be busy exactly on the duration
+                    // boundary. Retry for up to ~10 seconds; do not turn a
+                    // transient queue conflict into a false capture failure.
+                    v2SdAutoStop = task
+                    scanHandler.postDelayed(task, 250L)
+                } else {
+                    failV2SdCapture("Automatic SD STOP could not be queued after retries; reconcile device catalog")
+                }
+            }
+        } }
+        v2SdAutoStop = task
+        // Device independently enforces this finite duration. Android sends
+        // idempotent STOP to close its video/metadata lifecycle deterministically.
+        scanHandler.postDelayed(task, v2SdDurationSeconds.toLong() * 1_000L)
+    }
+
+    @Synchronized
+    private fun failV2SdCapture(message: String) {
+        if (v2SdPhase == V2SdPhase.IDLE) return
+        cancelV2SdAckTimeout()
+        cancelV2SdAutoStop()
+        v2SdPhase = V2SdPhase.IDLE
+        v2SdExpectedType = 0
+        v2SdPendingId = 0L
+        listener.onV2SdCaptureFailure(message)
+    }
+
+    @Synchronized
+    private fun armV2SdAckTimeout(gatt: BluetoothGatt) {
+        cancelV2SdAckTimeout()
+        if (v2SdExpectedType == 0) return
+        lateinit var task: Runnable
+        task = Runnable { synchronized(this) {
+            if (v2SdAckTimeout !== task || !isCurrentGatt(gatt) || v2SdExpectedType == 0)
+                return@synchronized
+            v2SdAckTimeout = null
+            failV2SdCapture("SD session response timeout; device state unknown. Reconnect/reconcile before restarting")
+        } }
+        v2SdAckTimeout = task
+        scanHandler.postDelayed(task, 6_000L)
+    }
+
+    @Synchronized
+    private fun onV2SdAck(frame: V2Frame) {
+        val b = frame.payload
+        if (frame.type == WoonaV2Codec.ERROR_RESPONSE) {
+            val status = b.firstOrNull()?.toInt()?.and(255) ?: -1
+            failV2SdCapture("SD session command rejected: $status; verify device state")
+            return
+        }
+        if (frame.type == 0x84 && v2SdPhase == V2SdPhase.WAIT_START) {
+            if (b.size != 24) { failV2SdCapture("Malformed SD START response"); return }
+            val bb = java.nio.ByteBuffer.wrap(b).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+            val status = b[0].toInt() and 255
+            val id = bb.getInt(4).toLong() and 0xffff_ffffL
+            val mask = bb.getInt(8).toLong() and 0xffff_ffffL
+            val duration = bb.getInt(12).toLong() and 0xffff_ffffL
+            val seq = bb.getLong(16)
+            if (status != 0 || b[1].toInt() != 2 || bb.getShort(2).toInt() != 0 ||
+                id == 0L || seq <= 0L || mask != v2SdStreamMask ||
+                duration != v2SdDurationSeconds.toLong()) {
+                failV2SdCapture("SD START rejected/mismatched; status=$status"); return
+            }
+            v2SdSessionId = id
+            v2SdSessionSeq = seq
+            v2SdPhase = V2SdPhase.RECORDING
+            listener.onV2SdCaptureStarted(id, seq, mask, v2SdDurationSeconds)
+            scheduleV2SdAutoStop()
+        } else if (frame.type == 0x85 && v2SdPhase == V2SdPhase.WAIT_STOP) {
+            if (b.size != 8) { failV2SdCapture("Malformed SD STOP response"); return }
+            val bb = java.nio.ByteBuffer.wrap(b).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+            val status = b[0].toInt() and 255
+            val sessionId = bb.getInt(4).toLong() and 0xffff_ffffL
+            if (status != 0 || b[1].toInt() != 0 || bb.getShort(2).toInt() != 0 ||
+                sessionId != v2SdSessionId) {
+                failV2SdCapture("SD STOP rejected/mismatched; status=$status"); return
+            }
+            val seq = v2SdSessionSeq
+            v2SdPhase = V2SdPhase.IDLE
+            cancelV2SdAutoStop()
+            listener.onV2SdCaptureStopped(sessionId, seq)
+        } else {
+            failV2SdCapture("Unexpected SD session response")
+        }
+    }
+
+    @Synchronized
+    private fun cancelV2StorageTimeout() {
+        v2StorageTimeoutRunnable?.let(scanHandler::removeCallbacks)
+        v2StorageTimeoutRunnable = null
+    }
+
+    @Synchronized
+    private fun armV2StorageTimeout(gatt: BluetoothGatt) {
+        cancelV2StorageTimeout()
+        if (v2StorageExpectedResponse == 0 && !v2StorageTransferActive) return
+        val task = object : Runnable {
+            override fun run() {
+                synchronized(this@BleSessionManager) {
+                    if (v2StorageTimeoutRunnable !== this || !isCurrentGatt(gatt) ||
+                        v2Failed || !v2Requested) return@synchronized
+                    v2StorageTimeoutRunnable = null
+                    val waitingFor = v2StorageExpectedResponse
+                    if (waitingFor != 0 && v2StorageRetryCount < 2 &&
+                        v2StoragePendingWire.isNotEmpty()) {
+                        ++v2StorageRetryCount
+                        // Retry the byte-identical request: same request_id,
+                        // therefore firmware replay cache can answer without
+                        // executing the mutating command twice.
+                        enqueueV2Frame(v2StoragePendingWire.clone())
+                        return@synchronized
+                    }
+                    v2StorageExpectedResponse = 0
+                    v2StorageTransferActive = false
+                    v2StoragePendingWire = ByteArray(0)
+                    v2StorageRetryCount = 0
+                    v2StorageEarlyFrames.clear()
+                    listener.onV2StorageFailure(if (waitingFor != 0)
+                        "Storage response 0x${waitingFor.toString(16)} timed out after retries"
+                        else "Stored record stream timed out")
+                }
+            }
+        }
+        v2StorageTimeoutRunnable = task
+        val timeoutMs = when (v2StorageExpectedResponse) {
+            WoonaV2StorageCodec.START_TRANSFER_RESPONSE -> 1_500L
+            0 -> 10_000L
+            else -> 6_000L
+        }
+        scanHandler.postDelayed(task, timeoutMs)
+    }
+
+    @Synchronized
+    private fun cancelV2TimeSyncTimeout() {
+        v2TimeSyncTimeout?.let(scanHandler::removeCallbacks)
+        v2TimeSyncTimeout = null
+    }
+
+    @Synchronized
+    private fun publishV2TimeSync(reason: String? = null) {
+        val best = WoonaV2TimeSync.bestSample(v2TimeSyncSamples)
+        listener.onV2TimeSyncStatus(WoonaV2TimeSync.Diagnostics(
+            collected = v2TimeSyncSamples.size,
+            total = WoonaV2TimeSync.DIAGNOSTIC_SAMPLES,
+            running = v2TimeSyncActive,
+            bestRttMs = best?.correctedRttNs?.div(1_000_000.0),
+            uncertaintyMs = best?.correctedRttNs?.div(2_000_000.0),
+            offsetMs = best?.let { (it.phoneMidNs / 1000.0 - it.deviceMidUs) / 1000.0 },
+            clockEpochId = best?.clockEpochId,
+            bestSample = best,
+            error = reason,
+        ))
+    }
+
+    @Synchronized
+    private fun failV2TimeSync(reason: String) {
+        if (!v2TimeSyncActive) return
+        v2TimeSyncActive = false
+        v2TimeSyncPendingId = 0L
+        v2TimeSyncNonce = 0L
+        v2TimeSyncT1Ns = 0L
+        cancelV2TimeSyncTimeout()
+        publishV2TimeSync(reason)
+    }
+
+    @Synchronized
+    private fun armV2TimeSyncTimeout(gatt: BluetoothGatt) {
+        cancelV2TimeSyncTimeout()
+        if (!v2TimeSyncActive || v2TimeSyncT1Ns == 0L || v2TimeSyncPendingId == 0L) return
+        lateinit var task: Runnable
+        task = Runnable { synchronized(this) {
+            if (v2TimeSyncTimeout !== task || !isCurrentGatt(gatt) || !v2TimeSyncActive)
+                return@synchronized
+            v2TimeSyncTimeout = null
+            failV2TimeSync("TIME_SYNC response timeout (5 s)")
+        } }
+        v2TimeSyncTimeout = task
+        scanHandler.postDelayed(task, 5_000L)
+    }
+
+    @Synchronized
+    private fun enqueueNextV2TimeSync(): Boolean {
+        if (!v2TimeSyncActive || v2TimeSyncPendingId != 0L) return false
+        val (seq, id) = try { v2Live?.reserveExternalCommandIds() ?: return false }
+                        catch (_: IllegalStateException) { return false }
+        val nonce = (SystemClock.elapsedRealtimeNanos() xor (id shl 19)).let {
+            if (it == 0L) id else it
+        }
+        v2TimeSyncNonce = nonce
+        v2TimeSyncPendingId = id
+        v2TimeSyncT1Ns = 0L
+        enqueueV2Frame(WoonaV2TimeSync.requestWire(seq, id, nonce))
+        return !v2Failed
     }
 
     @Synchronized
@@ -717,7 +977,8 @@ class BleSessionManager(
     override fun startV2Live(streamMask: Long): Boolean {
         val gatt = bluetoothGatt ?: return false
         val live = v2Live ?: return false
-        if (!v2Requested || v2Failed || !v2SupportsLive || !isCurrentGatt(gatt) || !notificationsReady ||
+        if (!v2Requested || v2Failed || v2SdPhase != V2SdPhase.IDLE || v2TimeSyncActive || v2StorageExpectedResponse != 0 ||
+            v2StorageTransferActive || !v2SupportsLive || !isCurrentGatt(gatt) || !notificationsReady ||
             !hasConnectPermission() || captureActive || recoveryInProgress ||
             v2Discovery?.phase != WoonaV2Discovery.Phase.READY ||
             live.phase !in setOf(WoonaV2LiveSession.Phase.IDLE, WoonaV2LiveSession.Phase.STOPPED)
@@ -729,6 +990,105 @@ class BleSessionManager(
             emitDiagnostic("V2 LIVE start rejected: ${exception.message}", DiagnosticLevel.WARNING)
             false
         }
+    }
+
+    @Synchronized
+    override fun startV2SdCapture(streamMask: Long, durationSeconds: Int): Boolean {
+        val gatt = bluetoothGatt ?: return false
+        if (!v2Requested || v2Failed || !notificationsReady || !v2SupportsStorage ||
+            !hasConnectPermission() || !isCurrentGatt(gatt) || v2TimeSyncActive ||
+            v2Discovery?.phase != WoonaV2Discovery.Phase.READY ||
+            v2Live?.phase !in setOf(WoonaV2LiveSession.Phase.IDLE, WoonaV2LiveSession.Phase.STOPPED) ||
+            v2SdPhase != V2SdPhase.IDLE || v2StorageExpectedResponse != 0 ||
+            v2StorageTransferActive || v2PendingFrames.isNotEmpty() || v2GattWrites.isBusy ||
+            streamMask == 0L || streamMask > 0xffff_ffffL || durationSeconds !in 10..1800)
+            return false
+        val (sequence, requestId) = try { v2Live?.reserveExternalCommandIds() ?: return false }
+            catch (_: IllegalStateException) { return false }
+        val payload = java.nio.ByteBuffer.allocate(12).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+            .put(2).put(0).put(0).put(0).putInt(streamMask.toInt())
+            .putInt(durationSeconds).array()
+        v2SdPendingId = requestId
+        v2SdExpectedType = 0x84
+        v2SdPhase = V2SdPhase.WAIT_START
+        v2SdStreamMask = streamMask
+        v2SdDurationSeconds = durationSeconds
+        enqueueV2Frame(WoonaV2Codec.encodeWire(WoonaV2Codec.START_SESSION,
+            sequence, requestId, payload))
+        return !v2Failed
+    }
+
+    @Synchronized
+    override fun stopV2SdCapture(): Boolean {
+        val gatt = bluetoothGatt ?: return false
+        // UI timer and BLE safety timer may fire together. Once WAIT_STOP is
+        // entered, STOP has already been accepted into the transport queue.
+        if (v2SdPhase == V2SdPhase.WAIT_STOP) return true
+        if (v2SdPhase != V2SdPhase.RECORDING || !isCurrentGatt(gatt) ||
+            !hasConnectPermission() || v2Failed || v2TimeSyncActive ||
+            v2StorageExpectedResponse != 0 || v2StorageTransferActive ||
+            v2PendingFrames.isNotEmpty() || v2GattWrites.isBusy) return false
+        val (sequence, requestId) = try { v2Live?.reserveExternalCommandIds() ?: return false }
+            catch (_: IllegalStateException) { return false }
+        val payload = java.nio.ByteBuffer.allocate(4).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+            .putInt(v2SdSessionId.toInt()).array()
+        v2SdPendingId = requestId
+        v2SdExpectedType = 0x85
+        v2SdPhase = V2SdPhase.WAIT_STOP
+        cancelV2SdAutoStop()
+        enqueueV2Frame(WoonaV2Codec.encodeWire(WoonaV2Codec.STOP_SESSION,
+            sequence, requestId, payload))
+        return !v2Failed
+    }
+
+    @Synchronized
+    override fun beginV2TimeSync(): Boolean {
+        val gatt = bluetoothGatt ?: return false
+        if (!v2Requested || v2Failed || v2SdPhase != V2SdPhase.IDLE || !v2SupportsTimeSync || !notificationsReady ||
+            !hasConnectPermission() || !isCurrentGatt(gatt) || v2TimeSyncActive ||
+            v2Discovery?.phase != WoonaV2Discovery.Phase.READY ||
+            v2Live?.phase !in setOf(WoonaV2LiveSession.Phase.IDLE, WoonaV2LiveSession.Phase.STOPPED) ||
+            v2StorageExpectedResponse != 0 || v2StorageTransferActive ||
+            v2PendingFrames.isNotEmpty() || v2GattWrites.isBusy) return false
+        v2TimeSyncSamples.clear()
+        v2TimeSyncActive = true
+        publishV2TimeSync()
+        if (!enqueueNextV2TimeSync()) {
+            failV2TimeSync("Cannot queue TIME_SYNC command")
+            return false
+        }
+        return true
+    }
+
+    @Synchronized
+    override fun sendV2StorageCommand(type: Int, payload: ByteArray): Boolean {
+        val gatt = bluetoothGatt ?: return false
+        if (!v2Requested || v2Failed || v2SdPhase != V2SdPhase.IDLE || v2TimeSyncActive || !v2SupportsStorage || !notificationsReady ||
+            !hasConnectPermission() || !isCurrentGatt(gatt) ||
+            v2Discovery?.phase != WoonaV2Discovery.Phase.READY ||
+            v2Live?.phase !in setOf(WoonaV2LiveSession.Phase.IDLE, WoonaV2LiveSession.Phase.STOPPED) ||
+            v2StorageExpectedResponse != 0 || v2PendingFrames.isNotEmpty() || v2GattWrites.isBusy ||
+            type !in setOf(WoonaV2Codec.GET_STORED_SESSIONS, WoonaV2Codec.START_STORED_TRANSFER,
+                WoonaV2Codec.STOP_STORED_TRANSFER) ||
+            (v2StorageTransferActive && type != WoonaV2Codec.STOP_STORED_TRANSFER) ||
+            (!v2StorageTransferActive && type == WoonaV2Codec.STOP_STORED_TRANSFER)) return false
+        val expected = when (type) {
+            WoonaV2Codec.GET_STORED_SESSIONS -> WoonaV2StorageCodec.SESSIONS_RESPONSE
+            WoonaV2Codec.START_STORED_TRANSFER -> WoonaV2StorageCodec.START_TRANSFER_RESPONSE
+            else -> WoonaV2StorageCodec.STOP_TRANSFER_RESPONSE
+        }
+        // LIVE and STORAGE share command IDs; firmware rejects backwards IDs.
+        val ids = try { v2Live?.reserveExternalCommandIds() ?: return false }
+                  catch (_: IllegalStateException) { return false }
+        val (sequence, requestId) = ids
+        v2StorageRequestId = requestId
+        v2StorageExpectedResponse = expected
+        v2StorageRetryCount = 0
+        if (type == WoonaV2Codec.START_STORED_TRANSFER) v2StorageEarlyFrames.clear()
+        val wire = WoonaV2Codec.encodeWire(type, sequence, requestId, payload)
+        v2StoragePendingWire = wire.clone()
+        enqueueV2Frame(wire)
+        return !v2Failed
     }
 
     @Synchronized
@@ -1023,6 +1383,7 @@ class BleSessionManager(
     @Synchronized
     private fun handleCharacteristicChanged(sourceGatt: BluetoothGatt, value: ByteArray) {
         if (!isCurrentGatt(sourceGatt)) return
+        val timeSyncT4Ns = SystemClock.elapsedRealtimeNanos()
         val nowElapsedRealtimeMs = SystemClock.elapsedRealtime()
         val previousNotificationElapsedRealtimeMs = lastNotificationElapsedRealtimeMs
         lastNotificationElapsedRealtimeMs = nowElapsedRealtimeMs
@@ -1070,6 +1431,105 @@ class BleSessionManager(
                         val live = v2Live
                         val frames = v2LiveReceiver?.append(value.clone()).orEmpty()
                         for (frame in frames) {
+                            if (v2StorageExpectedResponse == WoonaV2StorageCodec.START_TRANSFER_RESPONSE &&
+                                frame.requestId == 0L && frame.type in setOf(
+                                    WoonaV2Codec.STORED_DATA, WoonaV2Codec.STORED_TRANSFER_END)) {
+                                // A CRC/COBS-validated stored frame with request_id=0 can only be
+                                // emitted after START_STORED_TRANSFER was accepted. Do not discard
+                                // a real transfer merely because its small 0x89 control ACK was lost.
+                                cancelV2StorageTimeout()
+                                v2StorageExpectedResponse = 0
+                                v2StoragePendingWire = ByteArray(0)
+                                v2StorageRetryCount = 0
+                                v2StorageEarlyFrames.clear()
+                                v2StorageTransferActive = frame.type == WoonaV2Codec.STORED_DATA
+                                listener.onV2StorageFrame(frame)
+                                if (v2StorageTransferActive) armV2StorageTimeout(gatt)
+                                continue
+                            }
+                            val storageResponse = v2StorageExpectedResponse != 0 &&
+                                frame.requestId == v2StorageRequestId &&
+                                (frame.type == v2StorageExpectedResponse ||
+                                 frame.type == WoonaV2Codec.ERROR_RESPONSE)
+                            if (storageResponse) {
+                                val responseType = frame.type
+                                v2StorageExpectedResponse = 0
+                                v2StoragePendingWire = ByteArray(0)
+                                v2StorageRetryCount = 0
+                                if (responseType == WoonaV2StorageCodec.START_TRANSFER_RESPONSE &&
+                                    frame.payload.firstOrNull() == 0.toByte()) {
+                                    v2StorageTransferActive = true
+                                } else if (responseType == WoonaV2StorageCodec.STOP_TRANSFER_RESPONSE ||
+                                    responseType == WoonaV2Codec.ERROR_RESPONSE) {
+                                    v2StorageTransferActive = false
+                                    v2StorageEarlyFrames.clear()
+                                }
+                                armV2StorageTimeout(gatt)
+                                listener.onV2StorageFrame(frame)
+                                if (responseType == WoonaV2StorageCodec.START_TRANSFER_RESPONSE &&
+                                    v2StorageTransferActive) {
+                                    while (v2StorageEarlyFrames.isNotEmpty()) {
+                                        val early = v2StorageEarlyFrames.removeFirst()
+                                        if (early.type == WoonaV2Codec.STORED_TRANSFER_END)
+                                            v2StorageTransferActive = false
+                                        listener.onV2StorageFrame(early)
+                                    }
+                                    if (v2StorageTransferActive) armV2StorageTimeout(gatt)
+                                    else cancelV2StorageTimeout()
+                                }
+                                continue
+                            }
+                            if (v2StorageTransferActive && frame.requestId == 0L &&
+                                frame.type in setOf(WoonaV2Codec.STORED_DATA,
+                                    WoonaV2Codec.STORED_TRANSFER_END)) {
+                                if (frame.type == WoonaV2Codec.STORED_TRANSFER_END) {
+                                    v2StorageTransferActive = false
+                                }
+                                armV2StorageTimeout(gatt)
+                                listener.onV2StorageFrame(frame)
+                                continue
+                            }
+                            if (v2TimeSyncActive && frame.requestId == v2TimeSyncPendingId &&
+                                frame.type in setOf(WoonaV2TimeSync.RESPONSE, WoonaV2Codec.ERROR_RESPONSE)) {
+                                if (frame.type == WoonaV2Codec.ERROR_RESPONSE) {
+                                    failV2TimeSync("Device rejected TIME_SYNC (0xFF)")
+                                    continue
+                                }
+                                val reply = WoonaV2TimeSync.parseReply(frame,
+                                    v2TimeSyncPendingId, v2TimeSyncNonce)
+                                val sample = reply?.let {
+                                    WoonaV2TimeSync.makeSample(it, v2TimeSyncT1Ns, timeSyncT4Ns)
+                                }
+                                if (sample == null || v2TimeSyncSamples.any {
+                                    it.clockEpochId != sample.clockEpochId
+                                }) {
+                                    failV2TimeSync("Invalid TIME_SYNC response or clock epoch changed")
+                                    continue
+                                }
+                                cancelV2TimeSyncTimeout()
+                                v2TimeSyncSamples.add(sample)
+                                v2TimeSyncPendingId = 0L
+                                v2TimeSyncNonce = 0L
+                                v2TimeSyncT1Ns = 0L
+                                if (v2TimeSyncSamples.size == WoonaV2TimeSync.DIAGNOSTIC_SAMPLES) {
+                                    v2TimeSyncActive = false
+                                    publishV2TimeSync()
+                                } else {
+                                    publishV2TimeSync()
+                                    if (!enqueueNextV2TimeSync())
+                                        failV2TimeSync("Cannot enqueue next TIME_SYNC sample")
+                                }
+                                continue
+                            }
+                            if (v2SdExpectedType != 0 && frame.requestId == v2SdPendingId &&
+                                (frame.type == v2SdExpectedType ||
+                                    frame.type == WoonaV2Codec.ERROR_RESPONSE)) {
+                                cancelV2SdAckTimeout()
+                                v2SdPendingId = 0L
+                                v2SdExpectedType = 0
+                                onV2SdAck(frame)
+                                continue
+                            }
                             val events = live?.receive(frame).orEmpty()
                             if (events.any { it !is WoonaV2LiveSession.Event.Samples }) {
                                 cancelV2ResponseTimeout()
@@ -1111,6 +1571,9 @@ class BleSessionManager(
                 emitDiagnostic("V2 ready: streams=${event.device.streams.descriptors.size}, " +
                     "capabilities=0x${event.device.hello.capabilities.toString(16)}", DiagnosticLevel.INFO)
                 v2SupportsLive = event.device.hello.hasCapability(0)
+                v2SupportsStorage = event.device.hello.hasCapability(7) &&
+                    event.device.hello.hasCapability(8)
+                v2SupportsTimeSync = event.device.hello.hasCapability(WoonaV2TimeSync.CAPABILITY_BIT)
                 v2Live = WoonaV2LiveSession(event.device.streams)
                 v2LiveReceiver = WoonaV2StreamDecoder()
                 listener.onV2DiscoveryReady(event.device)
@@ -1157,6 +1620,10 @@ class BleSessionManager(
     private fun startNextV2Frame(gatt: BluetoothGatt) {
         if (v2Failed || manualDisconnectRequested || !v2Requested || v2GattWrites.isBusy || !isCurrentGatt(gatt)) return
         if (v2PendingFrames.isEmpty()) {
+            if (v2SdExpectedType != 0) armV2SdAckTimeout(gatt)
+            if (v2TimeSyncActive && v2TimeSyncPendingId != 0L) armV2TimeSyncTimeout(gatt)
+            if (v2StorageExpectedResponse != 0 || v2StorageTransferActive)
+                armV2StorageTimeout(gatt)
             val phase = v2Discovery?.phase
             val livePhase = v2Live?.phase
             if (phase in setOf(
@@ -1190,6 +1657,8 @@ class BleSessionManager(
             failV2Discovery("FFF2 is unavailable while sending V2")
             return
         }
+        if (v2TimeSyncActive && v2TimeSyncPendingId != 0L && v2TimeSyncT1Ns == 0L)
+            v2TimeSyncT1Ns = SystemClock.elapsedRealtimeNanos()
         val result = try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                 gatt.writeCharacteristic(characteristic, chunk, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT)
@@ -1213,6 +1682,16 @@ class BleSessionManager(
     private fun failV2Discovery(reason: String) {
         if (v2Failed) return
         v2Failed = true
+        failV2SdCapture("BLE V2 transport failed: $reason")
+        failV2TimeSync("BLE V2 transport failed: $reason")
+        val storageWasActive = v2StorageExpectedResponse != 0 || v2StorageTransferActive
+        cancelV2StorageTimeout()
+        v2StorageExpectedResponse = 0
+        v2StorageTransferActive = false
+        v2StoragePendingWire = ByteArray(0)
+        v2StorageRetryCount = 0
+        v2StorageEarlyFrames.clear()
+        if (storageWasActive) listener.onV2StorageFailure(reason)
         v2PendingFrames.clear()
         v2GattWrites.reset()
         cancelV2ResponseTimeout()
@@ -1226,6 +1705,20 @@ class BleSessionManager(
     private fun resetV2OnDisconnect() {
         v2ConnectionIntent = false
         v2ReportedRejectedFrames = 0
+        failV2SdCapture("BLE disconnected during SD recording; device may continue until timeout")
+        v2SdSessionId = 0L
+        v2SdSessionSeq = 0L
+        failV2TimeSync("BLE disconnected during TIME_SYNC")
+        v2SupportsTimeSync = false
+        cancelV2TimeSyncTimeout()
+        v2TimeSyncSamples.clear()
+        cancelV2StorageTimeout()
+        v2StorageExpectedResponse = 0
+        v2StorageTransferActive = false
+        v2StoragePendingWire = ByteArray(0)
+        v2StorageRetryCount = 0
+        v2StorageEarlyFrames.clear()
+        v2SupportsStorage = false
         cancelV2ResponseTimeout()
         cancelV2ChunkTimeout()
         v2GattWrites.reset()

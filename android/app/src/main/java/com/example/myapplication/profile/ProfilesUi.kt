@@ -143,6 +143,7 @@ fun ProfilesOverview(
     historyListState: androidx.compose.foundation.lazy.LazyListState = rememberLazyListState(),
     serverReports: Map<String, Pair<String?, Boolean>> = emptyMap(),
     onCheckServerRecording: (String) -> Unit = {},
+    sdHistory: @Composable () -> Unit = {},
 ) {
     var pendingLocalRemoval by remember { mutableStateOf<Recording?>(null) }
     pendingLocalRemoval?.let { recording ->
@@ -362,6 +363,7 @@ fun ProfilesOverview(
             if (recordingsLoading && recordings.isEmpty()) Card(Modifier.fillMaxWidth()) { header() }
             else LazyColumn(Modifier.fillMaxSize().testTag("recordings.history"), state = historyListState, verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 item(key = "history.header") { Card(Modifier.fillMaxWidth()) { header() } }
+                item(key = "history.sd.local") { sdHistory() }
                 items(recordings, key = { it.id }) { recording -> Card(Modifier.fillMaxWidth()) { content(recording) } }
                 item(key = "history.more") { more() }
             }

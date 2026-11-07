@@ -156,12 +156,14 @@ class MainActivity : ComponentActivity() {
 
     private val referencePicker = registerForActivityResult(ActivityResultContracts.GetContent()) { uri -> referenceUri = uri }
     private var pendingLiveAddress: String? = null
+    private var pendingV2SdQuestionnaireStart = false
     private var pendingReplayQuestionnaire: SessionQuestionnaire? = null
     private var sessionPreparationError by mutableStateOf<String?>(null)
     private var isChartFullscreenActive = false
     private var isCameraPermissionRequestInProgress = false
     private var pendingForegroundCaptureStart = false
     private var startCaptureAfterCameraPermission = false
+    private var startSdAfterCameraPermission = false
     private var startPolarScanAfterPermission = false
     private var pendingPreviewSurface: Surface? = null
 
@@ -189,15 +191,23 @@ class MainActivity : ComponentActivity() {
     ) { granted ->
         isCameraPermissionRequestInProgress = false
         if (granted) {
-            ensureCaptureService()
-            deviceFeatureController.setVideoPreviewSurface(pendingPreviewSurface)
-            if (startCaptureAfterCameraPermission) {
-                startCaptureAfterCameraPermission = false
-                startSynchronizedCaptureWhenServiceReady()
+            if (startSdAfterCameraPermission) {
+                startSdAfterCameraPermission = false
+                deviceFeatureController.onV2SdStartRequested()
+            } else {
+                ensureCaptureService()
+                deviceFeatureController.setVideoPreviewSurface(pendingPreviewSurface)
+                if (startCaptureAfterCameraPermission) {
+                    startCaptureAfterCameraPermission = false
+                    startSynchronizedCaptureWhenServiceReady()
+                }
             }
         } else {
             startCaptureAfterCameraPermission = false
-            deviceFeatureController.onVideoPermissionDenied()
+            if (startSdAfterCameraPermission) {
+                startSdAfterCameraPermission = false
+                toast("Для SD-видео разреши камеру или выключи видео в настройках SD-записи")
+            } else deviceFeatureController.onVideoPermissionDenied()
         }
     }
 
@@ -364,6 +374,8 @@ class MainActivity : ComponentActivity() {
                         },
                         onConnect = { address ->
                             if (!accountBusy && !isServerRestoreInProgress) {
+                                deviceFeatureController.onV2SdModeSelected(false)
+                                pendingV2SdQuestionnaireStart = false
                                 pendingLiveAddress = address
                                 isSessionQuestionnaireVisible = true
                             }
@@ -406,6 +418,7 @@ class MainActivity : ComponentActivity() {
                         onDisconnect = ::stopSession,
                         onV2Discovery = deviceFeatureController::onV2DiscoveryRequested,
                         onV2PreviewConnect = ::connectV2Preview,
+                        onV2SdConnect = ::connectV2Sd,
                         onV2PreviewScan = {
                             if (!accountBusy && !isServerRestoreInProgress && !deviceFeatureController.isCaptureActive()) {
                                 deviceFeatureController.onStartScanRequested(
@@ -417,6 +430,18 @@ class MainActivity : ComponentActivity() {
                         onV2StreamToggle = deviceFeatureController::onV2StreamToggled,
                         onV2LiveStart = deviceFeatureController::onV2LiveStartRequested,
                         onV2LiveStop = deviceFeatureController::onV2LiveStopRequested,
+                        v2StorageState = deviceFeatureController.v2StorageState,
+                        onV2StorageRefresh = deviceFeatureController::onV2StorageRefreshRequested,
+                        onV2StorageDownload = deviceFeatureController::onV2StorageDownloadRequested,
+                        onV2StorageStop = deviceFeatureController::onV2StorageStopRequested,
+                        timeSyncStatus = deviceFeatureController.v2TimeSyncState,
+                        onV2TimeSync = deviceFeatureController::onV2TimeSyncRequested,
+                        sdCapture = deviceFeatureController.v2SdCaptureState,
+                        sdMode = deviceFeatureController.v2SdModeSelected,
+                        onV2SdStart = ::prepareV2SdCapture,
+                        onV2SdStop = deviceFeatureController::onV2SdStopRequested,
+                        onV2SdDuration = deviceFeatureController::onV2SdDurationChanged,
+                        onV2SdVideo = deviceFeatureController::onV2SdVideoChanged,
                         onSensorSelect = deviceFeatureController::onSensorSelected,
                         onChannelSelect = deviceFeatureController::onChannelSelected,
                         onChartWindowSelect = deviceFeatureController::onChartWindowSelected,
@@ -499,6 +524,15 @@ class MainActivity : ComponentActivity() {
                                 selectedProfileId = selectedProfileId,
                                 recordings = recentRecordings,
                                 language = selectedLanguage,
+                                sdHistory = {
+                                    com.example.myapplication.feature.device.V2SdLocalHistory(
+                                        root = filesDir,
+                                        availableOnDevice = deviceFeatureController.v2StorageState.sessions
+                                            .mapTo(mutableSetOf()) { it.sequence },
+                                        downloadingSession = deviceFeatureController.v2StorageState.downloadingSession,
+                                        onDownload = deviceFeatureController::onV2StorageDownloadRequested,
+                                    )
+                                },
                                 onSelectProfile = ::selectProfile,
                                 onCreateProfile = {
                                     editingProfile = null
@@ -519,10 +553,18 @@ class MainActivity : ComponentActivity() {
                                 onDownloadRecording = ::downloadRecording,
                                 onRemoveLocalRecording = ::removeLocalRecordingFiles,
                                 localRemovalEnabled = !accountBusy && !isServerRestoreInProgress && !deviceFeatureController.isCaptureActive(),
-                                videoState = uiState.videoState,
+                                videoState = if (deviceFeatureController.v2SdVideoUiState != VideoCaptureState.IDLE)
+                                    deviceFeatureController.v2SdVideoUiState else uiState.videoState,
                                 videoOffsetMillis = uiState.videoOffsetMillis,
-                                onVideoAction = ::toggleCapture,
-                                showVideoPreview = deviceFeatureController.isVideoRequested(),
+                                onVideoAction = {
+                                    if (deviceFeatureController.v2SdVideoUiState != VideoCaptureState.IDLE) {
+                                        deviceFeatureController.onV2SdStopRequested()
+                                    } else {
+                                        toggleCapture()
+                                    }
+                                },
+                                showVideoPreview = deviceFeatureController.isVideoRequested() ||
+                                    deviceFeatureController.v2SdVideoUiState != VideoCaptureState.IDLE,
                                 onPreviewSurface = ::onPreviewSurfaceChanged,
                                 connectionQuality = uiState.connectionQuality,
                                 packetsLost = uiState.packetsLost,
@@ -583,22 +625,31 @@ class MainActivity : ComponentActivity() {
                         SessionQuestionnaireDialog(
                             language = selectedLanguage,
                             externalError = sessionPreparationError,
-                            videoAllowed = pendingLiveAddress != null,
+                            videoAllowed = pendingLiveAddress != null || pendingV2SdQuestionnaireStart,
                             onDismiss = {
                                 pendingLiveAddress = null
+                                pendingV2SdQuestionnaireStart = false
                                 pendingReplayQuestionnaire = null; sessionPreparationError = null
                                 isSessionQuestionnaireVisible = false
                             },
                             onSave = { questionnaire ->
                                 sessionPreparationError = null
-                                val address = pendingLiveAddress
-                                if (address == null) {
-                                    pendingReplayQuestionnaire = questionnaire
-                                    replayFilePickerLauncher.launch("*/*")
-                                } else {
-                                    startLiveRecording(address, questionnaire)
-                                    pendingLiveAddress = null
+                                if (pendingV2SdQuestionnaireStart) {
+                                    val profileId = requireNotNull(selectedProfileId) { "Select an animal before SD recording" }
+                                    deviceFeatureController.onV2SdQuestionnaireSelected(profileId, questionnaire)
+                                    pendingV2SdQuestionnaireStart = false
                                     isSessionQuestionnaireVisible = false
+                                    startV2SdCaptureWithPermission()
+                                } else {
+                                    val address = pendingLiveAddress
+                                    if (address == null) {
+                                        pendingReplayQuestionnaire = questionnaire
+                                        replayFilePickerLauncher.launch("*/*")
+                                    } else {
+                                        startLiveRecording(address, questionnaire)
+                                        pendingLiveAddress = null
+                                        isSessionQuestionnaireVisible = false
+                                    }
                                 }
                             },
                         )
@@ -754,6 +805,7 @@ class MainActivity : ComponentActivity() {
                 state.getBoolean(STATE_SESSION_QUESTIONNAIRE_VISIBLE)
             isServerSettingsVisible = state.getBoolean(STATE_SERVER_SETTINGS_VISIBLE)
             pendingLiveAddress = state.getString(STATE_PENDING_LIVE_ADDRESS)
+            pendingV2SdQuestionnaireStart = state.getBoolean(STATE_PENDING_V2_SD_QUESTIONNAIRE)
             pendingReplayQuestionnaire = state.getString(STATE_PENDING_REPLAY_QUESTIONNAIRE)
                 ?.let { json -> runCatching { sessionQuestionnaireFromJson(json) }.getOrNull() }
             sessionPreparationError = state.getString(STATE_SESSION_PREPARATION_ERROR)
@@ -798,6 +850,7 @@ class MainActivity : ComponentActivity() {
         outState.putString(STATE_EDITING_PROFILE_ID, editingProfile?.id)
         outState.putBoolean(STATE_SESSION_QUESTIONNAIRE_VISIBLE, isSessionQuestionnaireVisible)
         outState.putString(STATE_PENDING_LIVE_ADDRESS, pendingLiveAddress)
+        outState.putBoolean(STATE_PENDING_V2_SD_QUESTIONNAIRE, pendingV2SdQuestionnaireStart)
         outState.putString(
             STATE_PENDING_REPLAY_QUESTIONNAIRE,
             pendingReplayQuestionnaire?.toJson(),
@@ -915,7 +968,37 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private fun prepareV2SdCapture() {
+        if (selectedProfileId == null) {
+            toast(if (selectedLanguage == AppLanguage.RUSSIAN) "Сначала выберите животное" else "Select an animal first")
+            return
+        }
+        pendingV2SdQuestionnaireStart = true
+        pendingLiveAddress = null
+        pendingReplayQuestionnaire = null
+        sessionPreparationError = null
+        isSessionQuestionnaireVisible = true
+    }
+
+    private fun startV2SdCaptureWithPermission() {
+        if (deviceFeatureController.v2SdCaptureState.videoEnabled &&
+            ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) !=
+                android.content.pm.PackageManager.PERMISSION_GRANTED) {
+            startSdAfterCameraPermission = true
+            isCameraPermissionRequestInProgress = true
+            requestCameraPermissionLauncher.launch(Manifest.permission.CAMERA)
+            return
+        }
+        deviceFeatureController.onV2SdStartRequested()
+    }
+
+    private fun connectV2Sd(address: String) {
+        connectV2Preview(address)
+        deviceFeatureController.onV2SdModeSelected(true)
+    }
+
     private fun connectV2Preview(address: String) {
+        deviceFeatureController.onV2SdModeSelected(false)
         if (!startupReady || accountBusy || isServerRestoreInProgress || deviceFeatureController.isCaptureActive()) return
         pendingLiveAddress = null
         isSessionQuestionnaireVisible = false
@@ -1537,6 +1620,7 @@ class MainActivity : ComponentActivity() {
         const val STATE_EDITING_PROFILE_ID = "state_editing_profile_id"
         const val STATE_SESSION_QUESTIONNAIRE_VISIBLE = "state_session_questionnaire_visible"
         const val STATE_PENDING_LIVE_ADDRESS = "state_pending_live_address"
+        const val STATE_PENDING_V2_SD_QUESTIONNAIRE = "state_pending_v2_sd_questionnaire"
         const val STATE_PENDING_REPLAY_QUESTIONNAIRE = "state_pending_replay_questionnaire"
         const val STATE_SERVER_SETTINGS_VISIBLE = "state_server_settings_visible"
         const val STATE_SESSION_PREPARATION_ERROR = "state_session_preparation_error"

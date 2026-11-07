@@ -1,6 +1,8 @@
 package com.example.myapplication.feature.device
 
 import android.content.Context
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.setValue
 import android.content.Intent
 import android.os.SystemClock
 import android.util.Log
@@ -17,6 +19,8 @@ import com.example.myapplication.data.CaptureSyncMetadata
 import com.example.myapplication.data.Recording
 import com.example.myapplication.data.RecordingSource
 import com.example.myapplication.data.RecordingStatus
+import com.example.myapplication.data.SessionQuestionnaire
+import com.example.myapplication.data.validate
 import com.example.myapplication.data.SyncClockAnchor
 import com.example.myapplication.data.VideoSyncMetadata
 import com.example.myapplication.data.WoonaDatabase
@@ -25,6 +29,13 @@ import com.example.myapplication.data.monotonicOffsetNs
 import com.example.myapplication.data.toJson
 import com.example.myapplication.localization.EnglishTextResolver
 import com.example.myapplication.localization.TextResolver
+import com.example.myapplication.protocol.V2Frame
+import com.example.myapplication.protocol.WoonaV2StorageCodec
+import com.example.myapplication.protocol.WoonaV2TimeSync
+import com.example.myapplication.storage.V2StoredRecordStore
+import com.example.myapplication.storage.V2StorageTransferCoordinator
+import com.example.myapplication.storage.V2SdSessionMedia
+import com.example.myapplication.storage.V2SdRecordingImporter
 import com.example.myapplication.protocol.ConnectionQuality
 import com.example.myapplication.protocol.ConnectionQualitySnapshot
 import com.example.myapplication.protocol.ConnectionQualityTracker
@@ -64,6 +75,7 @@ class DeviceFeatureController(
     private val runOnUiThread: (() -> Unit) -> Unit = { action -> action() },
     private val woonaDatabase: WoonaDatabase? = null,
     private val snapshotDirectory: File? = null,
+    private val v2StorageRootDir: File? = null,
     private val onRecordingChanged: () -> Unit = {},
     private val videoRecorder: AndroidVideoRecorder? = null,
     private val polarSessionManager: PolarSessionManager? = null,
@@ -75,6 +87,450 @@ class DeviceFeatureController(
     private val onRecoveryRetryNeeded: () -> Unit = {},
     onCaptureLifecycleChanged: (Boolean) -> Unit = {},
 ) : AutoCloseable {
+    // Storage commands, decoded records and fsync share the same serialized IO worker.
+    private val v2StorageWorker = Executors.newSingleThreadExecutor { r ->
+        Thread(r, "v2-storage-io").apply { isDaemon = true }
+    }
+    private val v2StorageEpoch = AtomicLong(0L)
+    @Volatile private var v2StorageAddress: String? = null
+    private var v2StorageCoordinator: V2StorageTransferCoordinator? = null
+    private var v2StorageLastDownloadSequence: Long? = null
+    @Volatile private var v2StoragePendingCatalogDownload: Long? = null
+    private var v2StorageStateValue by androidx.compose.runtime.mutableStateOf(V2StorageUiState())
+    val v2StorageState: V2StorageUiState get() = v2StorageStateValue
+    private var v2TimeSyncValue by androidx.compose.runtime.mutableStateOf(WoonaV2TimeSync.Diagnostics())
+    val v2TimeSyncState: WoonaV2TimeSync.Diagnostics get() = v2TimeSyncValue
+    private var v2SdCaptureValue by androidx.compose.runtime.mutableStateOf(V2SdCaptureUiState())
+    val v2SdCaptureState: V2SdCaptureUiState get() = v2SdCaptureValue
+    private var sdChosenInConnectionDialog by androidx.compose.runtime.mutableStateOf(false)
+    val v2SdModeSelected: Boolean get() = sdChosenInConnectionDialog
+    val v2SdVideoUiState: VideoCaptureState
+        get() {
+            val sd = v2SdCaptureValue
+            if (!sdChosenInConnectionDialog || !sd.videoEnabled) return VideoCaptureState.IDLE
+            if (sd.phase == "stopping" || sd.phase == "finalizing") return VideoCaptureState.STOPPING
+            if (!sd.running) return VideoCaptureState.IDLE
+            val status = sd.videoStatus.lowercase()
+            return when {
+                status.contains("failed") || status.contains("unavailable") || status.contains("error") ->
+                    VideoCaptureState.DEGRADED
+                status.contains("starting video") -> VideoCaptureState.STARTING
+                else -> VideoCaptureState.RECORDING
+            }
+        }
+    fun onV2SdModeSelected(selected: Boolean) { sdChosenInConnectionDialog = selected }
+    private var v2SdProfileId: String? = null
+    private var v2SdQuestionnaire: SessionQuestionnaire? = null
+    fun onV2SdQuestionnaireSelected(profileId: String, questionnaire: SessionQuestionnaire) {
+        require(profileId.isNotBlank())
+        require(questionnaire.validate().isValid) { "Session questionnaire is incomplete" }
+        if (!v2SdCaptureValue.running && !v2SdCaptureValue.busy) {
+            v2SdProfileId = profileId
+            v2SdQuestionnaire = questionnaire
+            sdState(v2SdCaptureValue.copy(videoEnabled = questionnaire.videoRequested, error = null))
+        }
+    }
+    private val sdTickHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    private var sdTickStartNs: Long? = null
+    private val sdTick = object : Runnable {
+        override fun run() {
+            val start = sdTickStartNs ?: return
+            if (!v2SdCaptureValue.running) return
+            val elapsed = ((monotonicNanosProvider()-start).coerceAtLeast(0L)/1_000_000_000L)
+            val requested = v2SdCaptureValue.durationSeconds.toLong()
+            if (elapsed >= requested) {
+                v2SdCaptureValue = v2SdCaptureValue.copy(elapsedSeconds = requested)
+                // Device also has its own finite duration. This request obtains
+                // the STOP acknowledgement and closes Android video/metadata.
+                onV2SdStopRequested()
+                // A full GATT queue at the exact deadline is transient. Retry
+                // until the BLE layer accepts the idempotent STOP request.
+                if (v2SdCaptureValue.running && !v2SdCaptureValue.busy) {
+                    sdTickHandler.postDelayed(this, 250L)
+                }
+                return
+            }
+            v2SdCaptureValue = v2SdCaptureValue.copy(elapsedSeconds = elapsed)
+            sdTickHandler.postDelayed(this, 250L)
+        }
+    }
+    private fun stopSdTick() { sdTickHandler.removeCallbacks(sdTick); sdTickStartNs = null }
+    private fun startSdTick() {
+        stopSdTick()
+        sdTickStartNs = monotonicNanosProvider()
+        sdTickHandler.post(sdTick)
+    }
+    private var sdAutoSyncPending = false
+    private var sdSyncAnchor: WoonaV2TimeSync.Sample? = null
+    private var sdMedia: V2SdSessionMedia? = null
+    private var sdSessionGeneration = 0L
+    private var sdFinishing = false
+    private fun sdState(state: V2SdCaptureUiState) { v2SdCaptureValue = state }
+
+    fun onV2SdDurationChanged(seconds: Int) {
+        if (!v2SdCaptureValue.busy && !v2SdCaptureValue.running)
+            sdState(v2SdCaptureValue.copy(durationSeconds = seconds.coerceIn(60, 10_800)))
+    }
+    fun onV2SdVideoChanged(enabled: Boolean) {
+        if (!v2SdCaptureValue.busy && !v2SdCaptureValue.running)
+            sdState(v2SdCaptureValue.copy(videoEnabled = enabled))
+    }
+
+    fun onV2SdStartRequested() {
+        val current = v2SdCaptureValue
+        if (v2SdProfileId == null || v2SdQuestionnaire == null) {
+            sdState(current.copy(phase = "failed", error = "Заполните анкету сессии перед SD-записью"))
+            return
+        }
+        if (current.busy || current.running || v2StorageStateValue.busy ||
+            (uiState.v2SelectedStreamMask and uiState.v2StreamMask) == 0L ||
+            !canUseV2Storage() ||
+            (uiState.v2Capabilities and (1L shl WoonaV2TimeSync.CAPABILITY_BIT)) == 0L) {
+            sdState(current.copy(phase = "failed", error = "V2 SD requires idle BLE, SD and TIME_SYNC"))
+            return
+        }
+        sdAutoSyncPending = true
+        sdSyncAnchor = null
+        sdState(current.copy(phase = "syncing", busy = true, elapsedSeconds = 0L, error = null, sessionSequence = null,
+            videoStatus = "Synchronizing MCU and Android clocks"))
+        if (!bleSessionController.beginV2TimeSync()) {
+            sdAutoSyncPending = false
+            sdState(current.copy(phase = "failed", error = "Unable to start TIME_SYNC"))
+        }
+    }
+
+    fun onV2SdStopRequested() {
+        if (!v2SdCaptureValue.running || v2SdCaptureValue.busy) return
+        if (bleSessionController.stopV2SdCapture()) {
+            sdState(v2SdCaptureValue.copy(phase = "stopping", busy = true))
+        } else sdState(v2SdCaptureValue.copy(error = "Unable to send SD STOP"))
+    }
+
+    /** This is a test capture, separate from legacy recording history. */
+    fun onV2SdCaptureStarted(id: Long, seq: Long, mask: Long, durationSeconds: Int) {
+        if (!v2PreviewConnection || sdSyncAnchor == null || !sdAutoSyncPending) return
+        sdAutoSyncPending = false
+        val root = v2StorageRootDir ?: return
+        val address = v2StorageAddress ?: return
+        val sample = sdSyncAnchor ?: return
+        val videoEnabled = v2SdCaptureValue.videoEnabled
+        val media = try {
+            val questionnaire = requireNotNull(v2SdQuestionnaire)
+            require(videoEnabled == questionnaire.videoRequested) { "SD video choice differs from questionnaire" }
+            V2SdSessionMedia(root, address, seq, id, mask, durationSeconds, sample,
+                monotonicNanosProvider(), wallClockMillisProvider(), requireNotNull(v2SdProfileId),
+                questionnaire).also { it.writeStarted() }
+        } catch (error: Exception) {
+            sdState(v2SdCaptureValue.copy(phase = "failed", busy = false, running = true,
+                error = "SD started, but metadata persistence FAILED: ${error.message}. Stop manually"))
+            return
+        }
+        val generation = ++sdSessionGeneration
+        sdFinishing = false
+        sdMedia = media
+        startSdTick()
+        sdState(v2SdCaptureValue.copy(phase = "recording", busy = false, running = true,
+            sessionSequence = seq, error = null,
+            videoStatus = if (videoEnabled) "Starting video…" else "SD recording (video off)"))
+        if (videoEnabled) {
+            val started = try {
+                videoRecorder?.start(media.videoFile,
+                    onStarted = { info -> runOnUiThread {
+                        if (sdSessionGeneration == generation && sdMedia === media) {
+                            try {
+                                media.videoStarted(info)
+                                sdState(v2SdCaptureValue.copy(videoStatus = "Video recording; timestamps linked"))
+                            } catch (error: Exception) {
+                                sdState(v2SdCaptureValue.copy(videoStatus = "Video metadata error: ${error.message}"))
+                            }
+                        }
+                    } },
+                    onError = { message, _ -> runOnUiThread {
+                        if (sdSessionGeneration == generation && sdMedia === media) {
+                            runCatching { media.videoError(message) }
+                            sdState(v2SdCaptureValue.copy(videoStatus = "Camera failed: $message"))
+                        }
+                    } }) ?: false
+            } catch (_: Exception) { false }
+            if (!started) {
+                runCatching { media.videoError("Camera not started") }
+                sdState(v2SdCaptureValue.copy(videoStatus = "Camera unavailable — SD continues"))
+            }
+        }
+    }
+
+    fun onV2SdCaptureStopped(id: Long, seq: Long) {
+        stopSdTick()
+        if (sdFinishing) return
+        val media = sdMedia
+        if (media == null || media.sessionId != id || media.sequence != seq) {
+            sdState(v2SdCaptureValue.copy(phase = "failed", busy = false, running = false,
+                error = "STOP received, but media session identity mismatch"))
+            return
+        }
+        sdFinishing = true
+        sdState(v2SdCaptureValue.copy(phase = "finalizing", busy = true))
+        finishV2SdMedia(media, "completed", null)
+    }
+
+    fun onV2SdCaptureFailure(message: String) {
+        stopSdTick()
+        if (sdFinishing) return
+        sdAutoSyncPending = false
+        val media = sdMedia
+        if (media != null) {
+            sdFinishing = true
+            sdState(v2SdCaptureValue.copy(phase = "interrupted", busy = true, error = message))
+            finishV2SdMedia(media, "interrupted", message)
+        } else {
+            sdState(v2SdCaptureValue.copy(phase = "failed", busy = false, running = false,
+                error = message))
+        }
+    }
+
+    private fun finishV2SdMedia(media: V2SdSessionMedia, status: String, failure: String?) {
+        val generation = sdSessionGeneration
+        if (v2StorageWorker.isShutdown) {
+            sdState(v2SdCaptureValue.copy(phase = "interrupted", busy = false,
+                error = "Capture storage worker closed before video finalization"))
+            return
+        }
+        v2StorageWorker.execute {
+            val result = if (media.videoRequested) runCatching { videoRecorder?.stop() }
+                else Result.success(null)
+            val issue = result.exceptionOrNull()?.message ?: if (media.videoRequested && result.getOrNull() == null)
+                "Video did not produce a completed recording" else null
+            runCatching {
+                media.videoStopped(result.getOrNull())
+                media.finish(status, failure ?: issue)
+            }.onFailure { error ->
+                runOnUiThread {
+                    if (sdSessionGeneration == generation)
+                        sdState(v2SdCaptureValue.copy(error = "SD/video metadata persistence: ${error.message}"))
+                }
+            }
+            runOnUiThread {
+                if (sdSessionGeneration == generation && sdMedia === media) {
+                    sdMedia = null
+                    sdFinishing = false
+                    sdSyncAnchor = null
+                    v2SdProfileId = null
+                    v2SdQuestionnaire = null
+                    sdState(v2SdCaptureValue.copy(phase = status, busy = false, running = false,
+                        videoStatus = if (!media.videoRequested) "SD sync metadata saved (video disabled)"
+                            else if (issue == null) "Video and sync metadata saved locally"
+                            else "Video stop issue: $issue", error = failure ?: issue))
+                }
+            }
+        }
+    }
+
+    fun onV2TimeSyncStatus(status: WoonaV2TimeSync.Diagnostics) {
+        if (!v2PreviewConnection) return
+        v2TimeSyncValue = status
+        if (!sdAutoSyncPending || v2SdCaptureValue.phase != "syncing" || status.running) return
+        if (status.error != null || status.collected != status.total || status.bestSample == null) {
+            sdAutoSyncPending = false
+            sdState(v2SdCaptureValue.copy(phase = "failed", busy = false,
+                error = status.error ?: "Incomplete TIME_SYNC"))
+            return
+        }
+        sdSyncAnchor = status.bestSample
+        val mask = uiState.v2SelectedStreamMask and uiState.v2StreamMask
+        if (mask == 0L || !bleSessionController.startV2SdCapture(mask,
+                v2SdCaptureValue.durationSeconds)) {
+            sdAutoSyncPending = false
+            sdState(v2SdCaptureValue.copy(phase = "failed", busy = false,
+                error = "Cannot send SD START — select streams and retry"))
+            return
+        }
+        sdState(v2SdCaptureValue.copy(phase = "starting", busy = true,
+            videoStatus = "TIME_SYNC done; waiting for SD START acknowledgement"))
+    }
+
+    fun onV2TimeSyncRequested() {
+        if (!v2PreviewConnection || !uiState.v2Ready ||
+            (uiState.v2Capabilities and (1L shl WoonaV2TimeSync.CAPABILITY_BIT)) == 0L ||
+            !bleSessionController.beginV2TimeSync()) {
+            v2TimeSyncValue = WoonaV2TimeSync.Diagnostics(error =
+                "TIME_SYNC unavailable: stop LIVE/Storage, check V2 connection and firmware")
+        }
+    }
+
+    private var lastV2StoragePublishMs = 0L
+    private fun publishV2Storage(epoch: Long, state: V2StorageTransferCoordinator.Snapshot) {
+        val nowMs = android.os.SystemClock.elapsedRealtime()
+        if (state.downloading != null && state.busy &&
+            nowMs - lastV2StoragePublishMs < 250L) return
+        lastV2StoragePublishMs = nowMs
+        val pendingCatalogDownload = v2StoragePendingCatalogDownload
+        if (pendingCatalogDownload != null && !state.busy && state.downloading == null && !state.completed) {
+            v2StoragePendingCatalogDownload = null
+            if (state.sessions.any { it.sequence == pendingCatalogDownload }) {
+                v2StorageLastDownloadSequence = pendingCatalogDownload
+                if (!v2StorageWorker.isShutdown) v2StorageWorker.execute {
+                    if (epoch != v2StorageEpoch.get()) return@execute
+                    try {
+                        ensureV2Storage(epoch).download(pendingCatalogDownload)
+                    } catch (error: Exception) {
+                        runOnUiThread {
+                            if (epoch == v2StorageEpoch.get()) {
+                                v2StorageStateValue = v2StorageStateValue.copy(
+                                    busy = false, downloadingSession = null,
+                                    error = error.message ?: "Не удалось начать загрузку SD")
+                            }
+                        }
+                    }
+                }
+            } else {
+                v2StorageLastDownloadSequence = null
+                runOnUiThread {
+                    if (epoch == v2StorageEpoch.get()) {
+                        v2StorageStateValue = v2StorageStateValue.copy(
+                            busy = false, downloadingSession = null,
+                            error = "Сессия #$pendingCatalogDownload не найдена после обновления каталога SD")
+                    }
+                }
+            }
+        }
+        var importedRecordingId: String? = null
+        var integrationError: String? = null
+        if (state.completed) {
+            val sequence = v2StorageLastDownloadSequence
+            val root = v2StorageRootDir
+            val identity = v2StorageAddress
+            val database = woonaDatabase
+            if (sequence != null && root != null && identity != null && database != null) {
+                try {
+                    importedRecordingId = V2SdRecordingImporter.importCompleted(root, identity, sequence, database)
+                } catch (error: Exception) {
+                    integrationError = "Данные скачаны, но добавление в общую историю не завершено: ${error.message}"
+                } finally {
+                    v2StorageLastDownloadSequence = null
+                }
+            }
+        }
+        val local = if (state.completed || (!state.busy && state.downloading == null)) {
+            runCatching {
+                val root = requireNotNull(v2StorageRootDir)
+                val identity = requireNotNull(v2StorageAddress)
+                V2StoredRecordStore(root, identity).localSessions()
+            }.getOrNull()
+        } else null
+        runOnUiThread {
+            if (epoch == v2StorageEpoch.get()) {
+                v2StorageStateValue = v2StorageStateValue.copy(
+                    localSessions = local ?: v2StorageStateValue.localSessions,
+                    busy = state.busy, sessions = state.sessions,
+                    downloadingSession = state.downloading,
+                    savedRecords = state.savedRecords, totalRecords = state.totalRecords,
+                    completed = state.completed, error = integrationError ?: state.error)
+                if (importedRecordingId != null) recordingChangedListener()
+            }
+        }
+    }
+
+    /** Only call on v2StorageWorker, never the BLE callback thread. */
+    private fun ensureV2Storage(epoch: Long): V2StorageTransferCoordinator {
+        v2StorageCoordinator?.let { return it }
+        val identity = requireNotNull(v2StorageAddress) { "BLE device address unavailable" }
+        val root = requireNotNull(v2StorageRootDir) { "Persistent SD storage directory unavailable" }
+        val store = V2StoredRecordStore(root, identity)
+        return V2StorageTransferCoordinator(
+            sendRequest = { type, payload ->
+                if (epoch != v2StorageEpoch.get() ||
+                    !bleSessionController.sendV2StorageCommand(type, payload))
+                    error("BLE V2 Storage command rejected")
+            },
+            firstMissing = store::firstMissingRecord,
+            persist = { frame ->
+                val record = store.save(frame)
+                runCatching {
+                    V2SdSessionMedia.firstStoredBlockOffsetMs(root, identity,
+                        record.sessionSequence, record.timestampUs)
+                }.onSuccess { offset ->
+                    if (offset != null) runOnUiThread {
+                        if (epoch == v2StorageEpoch.get())
+                            v2SdCaptureValue = v2SdCaptureValue.copy(videoStatus =
+                                String.format(java.util.Locale.US,
+                                    "First SD block relative to first video frame: %.1f ms", offset))
+                    }
+                }
+            },
+            onUpdate = { publishV2Storage(epoch, it) },
+        ).also { v2StorageCoordinator = it }
+    }
+
+    private fun canUseV2Storage() = v2PreviewConnection && !v2SdCaptureValue.busy &&
+        !v2SdCaptureValue.running && uiState.v2Ready &&
+        uiState.v2DeviceSessionMode == 0 && !uiState.v2LiveRunning &&
+        (uiState.v2Capabilities and ((1L shl 7) or (1L shl 8))) ==
+            ((1L shl 7) or (1L shl 8))
+
+    private fun storageAction(action: (V2StorageTransferCoordinator) -> Unit) {
+        if (!canUseV2Storage() || v2StorageWorker.isShutdown) return
+        val epoch = v2StorageEpoch.get()
+        v2StorageWorker.execute {
+            if (epoch != v2StorageEpoch.get()) return@execute
+            try { action(ensureV2Storage(epoch)) }
+            catch (error: Exception) {
+                runOnUiThread {
+                    if (epoch == v2StorageEpoch.get())
+                        v2StorageStateValue = v2StorageStateValue.copy(busy = false,
+                            downloadingSession = null, error = error.message ?: "V2 Storage error")
+                }
+            }
+        }
+    }
+
+    fun onV2StorageRefreshRequested() = storageAction {
+        it.refresh()
+    }
+    fun onV2LocalSessionRefreshRequested() {
+        if (v2StorageWorker.isShutdown) return
+        val identity = v2StorageAddress ?: return
+        val root = v2StorageRootDir ?: return
+        v2StorageWorker.execute {
+            val local = runCatching { V2StoredRecordStore(root, identity).localSessions() }
+                .getOrDefault(emptyList())
+            runOnUiThread { v2StorageStateValue = v2StorageStateValue.copy(localSessions = local) }
+        }
+    }
+    fun onV2StorageDownloadRequested(sequence: Long) {
+        if (sequence <= 0L || v2StorageStateValue.busy) return
+        v2StoragePendingCatalogDownload = sequence
+        storageAction { it.refresh() }
+    }
+    fun onV2StorageStopRequested() = storageAction { it.stop() }
+
+    fun onV2StorageFrame(frame: V2Frame) {
+        val epoch = v2StorageEpoch.get()
+        if (!v2StorageWorker.isShutdown) v2StorageWorker.execute {
+            if (epoch == v2StorageEpoch.get()) v2StorageCoordinator?.onFrame(frame)
+        }
+    }
+
+    fun onV2StorageFailure(reason: String) {
+        val epoch = v2StorageEpoch.get()
+        if (!v2StorageWorker.isShutdown) v2StorageWorker.execute {
+            if (epoch == v2StorageEpoch.get())
+                v2StorageCoordinator?.interrupted(reason)
+        }
+    }
+
+    private fun resetV2Storage(reason: String?) {
+        v2StoragePendingCatalogDownload = null
+        v2StorageLastDownloadSequence = null
+        v2StorageEpoch.incrementAndGet()
+        if (!v2StorageWorker.isShutdown) v2StorageWorker.execute {
+            v2StorageCoordinator = null
+        }
+        runOnUiThread {
+            v2StorageStateValue = V2StorageUiState(
+                localSessions = v2StorageStateValue.localSessions, error = reason)
+        }
+    }
+
     @Volatile
     private var recordingChangedListener: () -> Unit = onRecordingChanged
     @Volatile
@@ -224,6 +680,19 @@ class DeviceFeatureController(
         pendingTransportDiagnostics.clear()
         awaitingCaptureReady = false
         packetCaptureController.stopCapture()
+        resetV2Storage(null)
+        v2TimeSyncValue = WoonaV2TimeSync.Diagnostics()
+        sdAutoSyncPending = false
+        sdSyncAnchor = null
+        sdMedia = null
+        stopSdTick()
+        v2SdProfileId = null
+        v2SdQuestionnaire = null
+        sdSessionGeneration++
+        sdFinishing = false
+        sdState(V2SdCaptureUiState())
+        v2StorageAddress = address
+        onV2LocalSessionRefreshRequested()
         v2PreviewConnection = true
         v2PreviewForeground = true
         uiStateHolder.onV2PreviewConnecting()
@@ -248,7 +717,7 @@ class DeviceFeatureController(
 
     /** Starts a diagnostic preview; no recording row, file writer or camera is started. */
     fun onV2LiveStartRequested() {
-        if (!v2PreviewConnection || isCaptureActive() || !uiState.v2Ready ||
+        if (!v2PreviewConnection || sdChosenInConnectionDialog || isCaptureActive() || v2SdCaptureValue.busy || v2SdCaptureValue.running || !uiState.v2Ready ||
             uiState.v2PreviewStage !in setOf(V2PreviewStage.READY, V2PreviewStage.STOPPED)) return
         val selectedMask = uiState.v2SelectedStreamMask and uiState.v2StreamMask
         uiStateHolder.onV2StartRequested()
@@ -623,6 +1092,12 @@ class DeviceFeatureController(
     }
 
     fun onBleStateChanged(state: BleSessionState) {
+        if (state == BleSessionState.DISCONNECTED || state == BleSessionState.FAILED) {
+            resetV2Storage("BLE disconnected — resume the transfer after reconnecting")
+            v2TimeSyncValue = WoonaV2TimeSync.Diagnostics(error = "BLE disconnected")
+            if (v2SdCaptureValue.busy || v2SdCaptureValue.running)
+                onV2SdCaptureFailure("BLE disconnected during SD capture; sensor state unknown")
+        }
         if (v2PreviewConnection) {
             uiStateHolder.onSessionStateChanged(state)
             if (state == BleSessionState.FAILED) {
@@ -817,6 +1292,9 @@ class DeviceFeatureController(
         }
         deleteSnapshotFiles(staleSnapshot)
         bleSessionController.close()
+        v2StorageEpoch.incrementAndGet()
+        stopSdTick()
+        v2StorageWorker.shutdownNow()
         polarSessionManager?.close()
         try { polarFileStore?.close() }
         catch (error: PolarPersistenceException) { Log.e("WOONA_CAPTURE", "Polar file closure previously failed", error) }

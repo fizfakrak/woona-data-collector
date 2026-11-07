@@ -106,10 +106,18 @@ fun DeviceOverviewScreen(
     onDisconnect: () -> Unit,
     onV2Discovery: () -> Unit = {},
     onV2PreviewConnect: (String) -> Unit = {},
+    onV2SdConnect: (String) -> Unit = {},
     onV2PreviewScan: () -> Unit = {},
     onV2StreamToggle: (Int) -> Unit = {},
     onV2LiveStart: () -> Unit = {},
     onV2LiveStop: () -> Unit = {},
+    sdMode: Boolean = false,
+    sdCapture: V2SdCaptureUiState = V2SdCaptureUiState(),
+    onV2SdStart: () -> Unit = {},
+    onV2SdStop: () -> Unit = {},
+    onV2SdDuration: (Int) -> Unit = {},
+    onV2SdVideo: (Boolean) -> Unit = {},
+    onV2StorageDownload: (Long) -> Unit = {},
     showReplayAction: Boolean,
     onReplayRequest: () -> Unit,
     profileContent: @Composable () -> Unit = {},
@@ -154,6 +162,7 @@ fun DeviceOverviewScreen(
                     onStartScan = onStartScan,
                     onConnect = onConnect,
                     onV2PreviewConnect = onV2PreviewConnect,
+                    onV2SdConnect = onV2SdConnect,
                     onV2PreviewScan = onV2PreviewScan,
                     showReplayAction = showReplayAction,
                     onReplayRequest = onReplayRequest,
@@ -164,7 +173,10 @@ fun DeviceOverviewScreen(
         }
 
         if (uiState.v2DiscoveryRequested) {
-            item { V2LivePreviewCard(uiState, onV2LiveStart, onV2LiveStop, onV2StreamToggle) }
+            if (sdMode) item { V2SdOverviewCard(uiState, sdCapture,
+                onV2SdStart,onV2SdStop,onV2SdDuration,onV2SdVideo,onV2StreamToggle,
+                onV2StorageDownload) }
+            else item { V2LivePreviewCard(uiState, onV2LiveStart, onV2LiveStop, onV2StreamToggle) }
             item { DisconnectCard(onDisconnect = onDisconnect, warnAboutSd = true) }
         }
 
@@ -172,6 +184,119 @@ fun DeviceOverviewScreen(
             EventLogSection(uiState = uiState)
         }
     }
+}
+
+
+@Composable
+private fun V2SdOverviewCard(ui: DeviceUiState, sd: V2SdCaptureUiState,
+    start: () -> Unit, stop: () -> Unit, duration: (Int) -> Unit,
+    video: (Boolean) -> Unit, toggle: (Int) -> Unit,
+    download: (Long) -> Unit) {
+    Card(colors = appCardColors()) { Column(Modifier.fillMaxWidth().padding(12.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Text("Запись на SD-карту", style = MaterialTheme.typography.titleMedium)
+        val supported = ui.v2Capabilities and (1L shl 1) != 0L
+        Text(if (supported) "После начала измерения сохраняются на устройстве; видеозапись — на телефоне."
+            else "SD отсутствует или не поддерживается прошивкой")
+        Text("Режим: ${sd.phase}")
+        var durationMinutesText by rememberSaveable { mutableStateOf((sd.durationSeconds / 60).toString()) }
+        val durationMinutesValue = durationMinutesText.toIntOrNull()
+        val durationInputValid = durationMinutesValue != null && durationMinutesValue in 1..180
+        if (!sd.running && !sd.busy) {
+            Text("Длительность записи")
+            androidx.compose.material3.OutlinedTextField(
+                value = durationMinutesText,
+                onValueChange = { entered ->
+                    val digits = entered.filter { it.isDigit() }.take(3)
+                    durationMinutesText = digits
+                    digits.toIntOrNull()?.takeIf { it in 1..180 }?.let { minutes ->
+                        duration(minutes * 60)
+                    }
+                },
+                modifier = Modifier.fillMaxWidth().testTag("v2.sd.duration.minutes"),
+                label = { Text("Время, минут") },
+                supportingText = {
+                    Text(if (durationInputValid) "От 1 до 180 минут · максимум 3 часа"
+                        else "Введите целое число от 1 до 180")
+                },
+                isError = !durationInputValid,
+                singleLine = true,
+                keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(
+                    keyboardType = androidx.compose.ui.text.input.KeyboardType.Number,
+                ),
+            )
+            Text("Быстрый выбор", style = MaterialTheme.typography.bodySmall)
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                listOf(5, 15, 60).forEach { minutes ->
+                    FilterChip(
+                        selected = durationInputValid && durationMinutesValue == minutes,
+                        onClick = {
+                            durationMinutesText = minutes.toString()
+                            duration(minutes * 60)
+                        },
+                        label = { Text("$minutes мин") },
+                    )
+                }
+            }
+            Text("Видео и описание сессии выбираются в общей анкете после нажатия «Начать SD».",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant)
+            val labels = listOf(R.string.v2_stream_accel,R.string.v2_stream_gyro,
+                R.string.v2_stream_contact,R.string.v2_stream_ambient,R.string.v2_stream_piezo,
+                R.string.v2_stream_temp1,R.string.v2_stream_temp2)
+            labels.forEachIndexed { index, label ->
+                if (ui.v2StreamMask and (1L shl index) != 0L) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        androidx.compose.material3.Checkbox(
+                            checked = ui.v2SelectedStreamMask and (1L shl index) != 0L,
+                            onCheckedChange = { toggle(index+1) })
+                        Text(appStringResource(label))
+                    }
+                }
+            }
+        }
+        if (sd.running) {
+            val elapsed = sd.elapsedSeconds
+            val total = sd.durationSeconds.toLong()
+            fun displayDuration(seconds: Long): String {
+                val hours = seconds / 3600
+                val minutes = (seconds % 3600) / 60
+                val secs = seconds % 60
+                return if (hours > 0) {
+                    "$hours:${minutes.toString().padStart(2,'0')}:${secs.toString().padStart(2,'0')}"
+                } else {
+                    "$minutes:${secs.toString().padStart(2,'0')}"
+                }
+            }
+            LinearProgressIndicator(progress = { (elapsed.toFloat()/total).coerceIn(0f,1f) },
+                modifier = Modifier.fillMaxWidth())
+            Text("Запись: ${displayDuration(elapsed)} / ${displayDuration(total)}")
+            Text("Таймер — по времени телефона с момента START_ACK, не таймер датчика.",
+                style = MaterialTheme.typography.bodySmall)
+        }
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Button(onClick = start, enabled = supported && ui.v2Ready && !sd.busy && !sd.running &&
+                durationInputValid && ui.v2SelectedStreamMask != 0L && ui.v2DeviceSessionMode == 0) {
+                Text("Начать SD")
+            }
+            OutlinedButton(onClick = stop, enabled = sd.running && !sd.busy) {
+                Text("Остановить")
+            }
+        }
+        sd.sessionSequence?.let { sequence ->
+            Text("SD #$sequence")
+            if (!sd.running && !sd.busy) {
+                Button(onClick = { download(sequence) }) { Text("Обновить SD и скачать") }
+                Text("Каталог датчика будет обновлён автоматически; загрузка продолжится с первого отсутствующего блока.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+        }
+        if (sd.videoStatus.isNotBlank()) Text(sd.videoStatus)
+        sd.error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
+        Text("Каталог и возобновление загрузки также доступны во вкладке SD-карта.",
+            style = MaterialTheme.typography.bodySmall)
+    } }
 }
 
 /** Explicit V2 diagnostic flow: never confuse preview with a persisted recording. */
@@ -557,13 +682,34 @@ private fun DeviceDiscoverySection(
     onStartScan: () -> Unit,
     onConnect: (String) -> Unit,
     onV2PreviewConnect: (String) -> Unit,
+    onV2SdConnect: (String) -> Unit,
     onV2PreviewScan: () -> Unit,
     showReplayAction: Boolean,
     onReplayRequest: () -> Unit,
 ) {
     var showConnectionDialog by rememberSaveable { mutableStateOf(false) }
-    var preview by rememberSaveable { mutableStateOf(false) }
-    OutlinedButton(onClick = { preview = false; showConnectionDialog = true }, modifier = Modifier.fillMaxWidth()) {
+    var connectionMode by rememberSaveable { mutableStateOf("legacy") }
+    Card(modifier = Modifier.fillMaxWidth()) {
+        Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text("Режим сессии", style = MaterialTheme.typography.titleSmall)
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                FilterChip(selected = connectionMode == "legacy", onClick = { connectionMode = "legacy" },
+                    label = { Text("Legacy") }, modifier = Modifier.testTag("session.mode.legacy"))
+                FilterChip(selected = connectionMode == "preview", onClick = { connectionMode = "preview" },
+                    label = { Text(appStringResource(R.string.v2_preview_title)) }, modifier = Modifier.testTag("session.mode.v2"))
+            }
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                FilterChip(selected = connectionMode == "sd", onClick = { connectionMode = "sd" },
+                    label = { Text("SD-запись") }, modifier = Modifier.testTag("session.mode.sd"))
+            }
+            Text(when (connectionMode) {
+                "preview" -> "V2 без сохранения сессии: просмотр потоков и диагностика."
+                "sd" -> "Запись на датчик; после загрузки телефон создаёт обычную запись приложения."
+                else -> "Legacy: потоковая запись непосредственно на телефон."
+            }, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+    }
+    OutlinedButton(onClick = { showConnectionDialog = true }, modifier = Modifier.fillMaxWidth()) {
         Text(appStringResource(R.string.new_connection))
     }
     if (showConnectionDialog) {
@@ -571,15 +717,12 @@ private fun DeviceDiscoverySection(
             Column(modifier = Modifier.verticalScroll(rememberScrollState())) {
                 Surface {
                     Column(modifier = Modifier.padding(12.dp)) {
-                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            FilterChip(selected = !preview, onClick = { preview = false },
-                                label = { Text(appStringResource(R.string.v2_recording_purpose)) },
-                                modifier = Modifier.testTag("ble.purpose.recording"))
-                            FilterChip(selected = preview, onClick = { preview = true },
-                                label = { Text(appStringResource(R.string.v2_preview_title)) },
-                                modifier = Modifier.testTag("ble.purpose.v2"))
-                        }
-                        if (preview) {
+                        Text("Режим: " + when (connectionMode) {
+                            "preview" -> "V2 предпросмотр"
+                            "sd" -> "SD-запись"
+                            else -> "Legacy"
+                        }, style = MaterialTheme.typography.bodySmall)
+                        if (connectionMode != "legacy") {
                             Text(appStringResource(R.string.v2_preview_intro), style = MaterialTheme.typography.bodySmall)
                             Text(appStringResource(R.string.v2_sd_disconnect_warning), style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.error)
@@ -587,8 +730,15 @@ private fun DeviceDiscoverySection(
                     }
                 }
                 DeviceDiscoveryDialogContent(
-                    uiState, if (preview) onV2PreviewScan else onStartScan,
-                    onConnect = { address -> showConnectionDialog = false; if (preview) onV2PreviewConnect(address) else onConnect(address) },
+                    uiState, if (connectionMode != "legacy") onV2PreviewScan else onStartScan,
+                    onConnect = { address ->
+                        showConnectionDialog = false
+                        when (connectionMode) {
+                            "sd" -> onV2SdConnect(address)
+                            "preview" -> onV2PreviewConnect(address)
+                            else -> onConnect(address)
+                        }
+                    },
                     showReplayAction = showReplayAction,
                     onReplayRequest = { showConnectionDialog = false; onReplayRequest() },
                 )
@@ -2440,10 +2590,18 @@ object DeviceScreenEntryPoint {
         onDisconnect: () -> Unit,
         onV2Discovery: () -> Unit = {},
         onV2PreviewConnect: (String) -> Unit = {},
+        onV2SdConnect: (String) -> Unit = {},
         onV2PreviewScan: () -> Unit = {},
         onV2StreamToggle: (Int) -> Unit = {},
         onV2LiveStart: () -> Unit = {},
         onV2LiveStop: () -> Unit = {},
+        sdMode: Boolean = false,
+        sdCapture: V2SdCaptureUiState = V2SdCaptureUiState(),
+        onV2SdStart: () -> Unit = {},
+        onV2SdStop: () -> Unit = {},
+        onV2SdDuration: (Int) -> Unit = {},
+        onV2SdVideo: (Boolean) -> Unit = {},
+        onV2StorageDownload: (Long) -> Unit = {},
         showReplayAction: Boolean,
         onReplayRequest: () -> Unit,
         profileContent: @Composable () -> Unit = {},
@@ -2456,10 +2614,18 @@ object DeviceScreenEntryPoint {
             onDisconnect = onDisconnect,
             onV2Discovery = onV2Discovery,
             onV2PreviewConnect = onV2PreviewConnect,
+            onV2SdConnect = onV2SdConnect,
             onV2PreviewScan = onV2PreviewScan,
             onV2StreamToggle = onV2StreamToggle,
             onV2LiveStart = onV2LiveStart,
             onV2LiveStop = onV2LiveStop,
+            sdMode = sdMode,
+            sdCapture = sdCapture,
+            onV2SdStart = onV2SdStart,
+            onV2SdStop = onV2SdStop,
+            onV2SdDuration = onV2SdDuration,
+            onV2SdVideo = onV2SdVideo,
+            onV2StorageDownload = onV2StorageDownload,
             showReplayAction = showReplayAction,
             onReplayRequest = onReplayRequest,
             profileContent = profileContent,

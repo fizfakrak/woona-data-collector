@@ -1,0 +1,747 @@
+﻿diff --git a/android/app/src/main/java/com/example/myapplication/AppShell.kt b/android/app/src/main/java/com/example/myapplication/AppShell.kt
+index be3a200..9da7065 100644
+--- a/android/app/src/main/java/com/example/myapplication/AppShell.kt
++++ b/android/app/src/main/java/com/example/myapplication/AppShell.kt
+@@ -60,6 +60,7 @@ import com.example.myapplication.feature.device.DeviceScreenEntryPoint
+ import com.example.myapplication.feature.device.DeviceUiState
+ import com.example.myapplication.feature.device.V2StorageScreen
+ import com.example.myapplication.feature.device.V2StorageUiState
++import com.example.myapplication.feature.device.V2StorageActions
+ import com.example.myapplication.feature.device.ExportPhase
+ import com.example.myapplication.localization.AppLanguage
+ import com.example.myapplication.localization.appStringResource
+@@ -111,6 +112,10 @@ fun DeviceAppShell(
+     onV2StreamToggle: (Int) -> Unit = {},
+     onV2LiveStart: () -> Unit = {},
+     onV2LiveStop: () -> Unit = {},
++    v2StorageState: V2StorageUiState = V2StorageUiState(),
++    onV2StorageRefresh: () -> Unit = {},
++    onV2StorageDownload: (Long) -> Unit = {},
++    onV2StorageStop: () -> Unit = {},
+     onSensorSelect: (Int) -> Unit,
+     onChannelSelect: (Int) -> Unit,
+     onChartWindowSelect: (ChartWindowPreset) -> Unit,
+@@ -221,11 +226,21 @@ fun DeviceAppShell(
+                                     storageSupported = (uiState.v2Capabilities and
+                                         ((1L shl 7) or (1L shl 8))) ==
+                                         ((1L shl 7) or (1L shl 8)),
+-                                    busy = uiState.v2DeviceSessionMode != 0,
++                                    busy = uiState.v2DeviceSessionMode != 0 ||
++                                        uiState.v2LiveRunning || v2StorageState.busy,
++                                    sessions = v2StorageState.sessions,
++                                    downloadingSession = v2StorageState.downloadingSession,
++                                    savedRecords = v2StorageState.savedRecords,
++                                    totalRecords = v2StorageState.totalRecords,
++                                    completed = v2StorageState.completed,
++                                    error = v2StorageState.error,
+                                 ),
+                                 language = selectedLanguage,
+-                                // Commands intentionally unavailable until feature controller,
+-                                // durable record writer and server ACK path are wired.
++                                actions = V2StorageActions(
++                                    refresh = onV2StorageRefresh,
++                                    download = onV2StorageDownload,
++                                    stopTransfer = onV2StorageStop,
++                                ),
+                             )
+                         } else if (!showSessionCharts) DeviceScreenEntryPoint.Overview(
+                             uiState = uiState.copy(errorMessage = null),
+@@ -713,6 +728,10 @@ object AppShellEntryPoint {
+         onV2StreamToggle: (Int) -> Unit = {},
+         onV2LiveStart: () -> Unit = {},
+         onV2LiveStop: () -> Unit = {},
++        v2StorageState: V2StorageUiState = V2StorageUiState(),
++        onV2StorageRefresh: () -> Unit = {},
++        onV2StorageDownload: (Long) -> Unit = {},
++        onV2StorageStop: () -> Unit = {},
+         onSensorSelect: (Int) -> Unit,
+         onChannelSelect: (Int) -> Unit,
+         onChartWindowSelect: (ChartWindowPreset) -> Unit,
+@@ -762,6 +781,10 @@ object AppShellEntryPoint {
+             onV2StreamToggle = onV2StreamToggle,
+             onV2LiveStart = onV2LiveStart,
+             onV2LiveStop = onV2LiveStop,
++            v2StorageState = v2StorageState,
++            onV2StorageRefresh = onV2StorageRefresh,
++            onV2StorageDownload = onV2StorageDownload,
++            onV2StorageStop = onV2StorageStop,
+             onSensorSelect = onSensorSelect,
+             onChannelSelect = onChannelSelect,
+             onChartWindowSelect = onChartWindowSelect,
+diff --git a/android/app/src/main/java/com/example/myapplication/DeviceFeatureModule.kt b/android/app/src/main/java/com/example/myapplication/DeviceFeatureModule.kt
+index 55976fa..95b493a 100644
+--- a/android/app/src/main/java/com/example/myapplication/DeviceFeatureModule.kt
++++ b/android/app/src/main/java/com/example/myapplication/DeviceFeatureModule.kt
+@@ -266,6 +266,14 @@ fun createDeviceFeatureController(
+                 }
+             }
+ 
++            override fun onV2StorageFrame(frame: com.example.myapplication.protocol.V2Frame) {
++                deviceFeatureController?.onV2StorageFrame(frame)
++            }
++
++            override fun onV2StorageFailure(reason: String) {
++                deviceFeatureController?.onV2StorageFailure(reason)
++            }
++
+             override fun onV2FrameRejections(total: Long) {
+                 if (deviceFeatureController?.isV2PreviewForeground() != true) return
+                 val schedule = synchronized(v2PreviewLock) {
+@@ -430,6 +438,7 @@ fun createDeviceFeatureController(
+         },
+         woonaDatabase = woonaDatabase,
+         snapshotDirectory = snapshotDirectory,
++        v2StorageRootDir = filesDir,
+         onRecordingChanged = onRecordingChanged,
+         videoRecorder = AndroidVideoRecorder(context),
+         polarSessionManager = polarSessionManager,
+diff --git a/android/app/src/main/java/com/example/myapplication/MainActivity.kt b/android/app/src/main/java/com/example/myapplication/MainActivity.kt
+index 1f39c6e..be72d63 100644
+--- a/android/app/src/main/java/com/example/myapplication/MainActivity.kt
++++ b/android/app/src/main/java/com/example/myapplication/MainActivity.kt
+@@ -417,6 +417,10 @@ class MainActivity : ComponentActivity() {
+                         onV2StreamToggle = deviceFeatureController::onV2StreamToggled,
+                         onV2LiveStart = deviceFeatureController::onV2LiveStartRequested,
+                         onV2LiveStop = deviceFeatureController::onV2LiveStopRequested,
++                        v2StorageState = deviceFeatureController.v2StorageState,
++                        onV2StorageRefresh = deviceFeatureController::onV2StorageRefreshRequested,
++                        onV2StorageDownload = deviceFeatureController::onV2StorageDownloadRequested,
++                        onV2StorageStop = deviceFeatureController::onV2StorageStopRequested,
+                         onSensorSelect = deviceFeatureController::onSensorSelected,
+                         onChannelSelect = deviceFeatureController::onChannelSelected,
+                         onChartWindowSelect = deviceFeatureController::onChartWindowSelected,
+diff --git a/android/app/src/main/java/com/example/myapplication/ble/BleSessionManager.kt b/android/app/src/main/java/com/example/myapplication/ble/BleSessionManager.kt
+index 362c58f..8315c47 100644
+--- a/android/app/src/main/java/com/example/myapplication/ble/BleSessionManager.kt
++++ b/android/app/src/main/java/com/example/myapplication/ble/BleSessionManager.kt
+@@ -22,6 +22,9 @@ import android.util.Log
+ import androidx.core.content.ContextCompat
+ import com.example.myapplication.R
+ import com.example.myapplication.localization.AppTextResolver
++import com.example.myapplication.protocol.V2Frame
++import com.example.myapplication.protocol.WoonaV2Codec
++import com.example.myapplication.protocol.WoonaV2StorageCodec
+ import com.example.myapplication.protocol.WoonaV2Discovery
+ import com.example.myapplication.protocol.WoonaV2LiveSession
+ import com.example.myapplication.protocol.WoonaV2StreamDecoder
+@@ -49,6 +52,8 @@ interface BleSessionListener {
+     /** Fully validated frame, still containing original LE sample bytes. */
+     fun onV2LiveSamples(event: WoonaV2LiveSession.Event.Samples) = Unit
+     fun onV2LiveStopped(sessionId: Long) = Unit
++    fun onV2StorageFrame(frame: V2Frame) = Unit
++    fun onV2StorageFailure(reason: String) = Unit
+     fun onStateChanged(state: BleSessionState)
+     fun onError(message: String, throwable: Throwable? = null)
+ }
+@@ -70,6 +75,7 @@ interface BleSessionController {
+     /** Only after explicit discovery, never during an ordinary Legacy capture. */
+     fun startV2Live(streamMask: Long): Boolean = false
+     fun stopV2Live(): Boolean = false
++    fun sendV2StorageCommand(type: Int, payload: ByteArray): Boolean = false
+     fun setCaptureActive(active: Boolean) = Unit
+     fun disconnect()
+     fun close()
+@@ -95,6 +101,11 @@ class BleSessionManager(
+     private var v2Live: WoonaV2LiveSession? = null
+     private var v2LiveReceiver: WoonaV2StreamDecoder? = null
+     private var v2SupportsLive = false
++    private var v2SupportsStorage = false
++    private var v2StorageRequestId = 0L
++    private var v2StorageExpectedResponse = 0
++    private var v2StorageTransferActive = false
++    private var v2StorageTimeoutRunnable: Runnable? = null
+     private var v2WriteCharacteristic: BluetoothGattCharacteristic? = null
+     @Volatile private var v2Requested = false
+     @Volatile private var v2ConnectionIntent = false
+@@ -117,6 +128,35 @@ class BleSessionManager(
+         v2ChunkTimeoutRunnable = null
+     }
+ 
++    @Synchronized
++    private fun cancelV2StorageTimeout() {
++        v2StorageTimeoutRunnable?.let(scanHandler::removeCallbacks)
++        v2StorageTimeoutRunnable = null
++    }
++
++    @Synchronized
++    private fun armV2StorageTimeout(gatt: BluetoothGatt) {
++        cancelV2StorageTimeout()
++        if (v2StorageExpectedResponse == 0 && !v2StorageTransferActive) return
++        val task = object : Runnable {
++            override fun run() {
++                synchronized(this@BleSessionManager) {
++                    if (v2StorageTimeoutRunnable !== this || !isCurrentGatt(gatt) ||
++                        v2Failed || !v2Requested) return@synchronized
++                    v2StorageTimeoutRunnable = null
++                    val waitingFor = v2StorageExpectedResponse
++                    v2StorageExpectedResponse = 0
++                    v2StorageTransferActive = false
++                    listener.onV2StorageFailure(if (waitingFor != 0)
++                        "Storage response 0x${waitingFor.toString(16)} timed out"
++                        else "Stored record stream timed out")
++                }
++            }
++        }
++        v2StorageTimeoutRunnable = task
++        scanHandler.postDelayed(task, if (v2StorageExpectedResponse != 0) 6_000L else 10_000L)
++    }
++
+     @Synchronized
+     private fun armV2ResponseTimeout(gatt: BluetoothGatt) {
+         cancelV2ResponseTimeout()
+@@ -717,7 +757,8 @@ class BleSessionManager(
+     override fun startV2Live(streamMask: Long): Boolean {
+         val gatt = bluetoothGatt ?: return false
+         val live = v2Live ?: return false
+-        if (!v2Requested || v2Failed || !v2SupportsLive || !isCurrentGatt(gatt) || !notificationsReady ||
++        if (!v2Requested || v2Failed || v2StorageExpectedResponse != 0 ||
++            v2StorageTransferActive || !v2SupportsLive || !isCurrentGatt(gatt) || !notificationsReady ||
+             !hasConnectPermission() || captureActive || recoveryInProgress ||
+             v2Discovery?.phase != WoonaV2Discovery.Phase.READY ||
+             live.phase !in setOf(WoonaV2LiveSession.Phase.IDLE, WoonaV2LiveSession.Phase.STOPPED)
+@@ -731,6 +772,34 @@ class BleSessionManager(
+         }
+     }
+ 
++    @Synchronized
++    override fun sendV2StorageCommand(type: Int, payload: ByteArray): Boolean {
++        val gatt = bluetoothGatt ?: return false
++        if (!v2Requested || v2Failed || !v2SupportsStorage || !notificationsReady ||
++            !hasConnectPermission() || !isCurrentGatt(gatt) ||
++            v2Discovery?.phase != WoonaV2Discovery.Phase.READY ||
++            v2Live?.phase !in setOf(WoonaV2LiveSession.Phase.IDLE, WoonaV2LiveSession.Phase.STOPPED) ||
++            v2StorageExpectedResponse != 0 || v2PendingFrames.isNotEmpty() || v2GattWrites.isBusy ||
++            type !in setOf(WoonaV2Codec.GET_STORED_SESSIONS, WoonaV2Codec.START_STORED_TRANSFER,
++                WoonaV2Codec.STOP_STORED_TRANSFER) ||
++            (v2StorageTransferActive && type != WoonaV2Codec.STOP_STORED_TRANSFER) ||
++            (!v2StorageTransferActive && type == WoonaV2Codec.STOP_STORED_TRANSFER)) return false
++        val expected = when (type) {
++            WoonaV2Codec.GET_STORED_SESSIONS -> WoonaV2StorageCodec.SESSIONS_RESPONSE
++            WoonaV2Codec.START_STORED_TRANSFER -> WoonaV2StorageCodec.START_TRANSFER_RESPONSE
++            else -> WoonaV2StorageCodec.STOP_TRANSFER_RESPONSE
++        }
++        // LIVE and STORAGE share command IDs; firmware rejects backwards IDs.
++        val ids = try { v2Live?.reserveExternalCommandIds() ?: return false }
++                  catch (_: IllegalStateException) { return false }
++        val (sequence, requestId) = ids
++        v2StorageRequestId = requestId
++        v2StorageExpectedResponse = expected
++        enqueueV2Frame(WoonaV2Codec.encodeWire(type, sequence,
++            requestId, payload))
++        return !v2Failed
++    }
++
+     @Synchronized
+     override fun stopV2Live(): Boolean {
+         val gatt = bluetoothGatt ?: return false
+@@ -1070,6 +1139,34 @@ class BleSessionManager(
+                         val live = v2Live
+                         val frames = v2LiveReceiver?.append(value.clone()).orEmpty()
+                         for (frame in frames) {
++                            val storageResponse = v2StorageExpectedResponse != 0 &&
++                                frame.requestId == v2StorageRequestId &&
++                                (frame.type == v2StorageExpectedResponse ||
++                                 frame.type == WoonaV2Codec.ERROR_RESPONSE)
++                            if (storageResponse) {
++                                val responseType = frame.type
++                                v2StorageExpectedResponse = 0
++                                if (responseType == WoonaV2StorageCodec.START_TRANSFER_RESPONSE &&
++                                    frame.payload.firstOrNull() == 0.toByte()) {
++                                    v2StorageTransferActive = true
++                                } else if (responseType == WoonaV2StorageCodec.STOP_TRANSFER_RESPONSE ||
++                                    responseType == WoonaV2Codec.ERROR_RESPONSE) {
++                                    v2StorageTransferActive = false
++                                }
++                                armV2StorageTimeout(gatt)
++                                listener.onV2StorageFrame(frame)
++                                continue
++                            }
++                            if (v2StorageTransferActive && frame.requestId == 0L &&
++                                frame.type in setOf(WoonaV2Codec.STORED_DATA,
++                                    WoonaV2Codec.STORED_TRANSFER_END)) {
++                                if (frame.type == WoonaV2Codec.STORED_TRANSFER_END) {
++                                    v2StorageTransferActive = false
++                                }
++                                armV2StorageTimeout(gatt)
++                                listener.onV2StorageFrame(frame)
++                                continue
++                            }
+                             val events = live?.receive(frame).orEmpty()
+                             if (events.any { it !is WoonaV2LiveSession.Event.Samples }) {
+                                 cancelV2ResponseTimeout()
+@@ -1111,6 +1208,8 @@ class BleSessionManager(
+                 emitDiagnostic("V2 ready: streams=${event.device.streams.descriptors.size}, " +
+                     "capabilities=0x${event.device.hello.capabilities.toString(16)}", DiagnosticLevel.INFO)
+                 v2SupportsLive = event.device.hello.hasCapability(0)
++                v2SupportsStorage = event.device.hello.hasCapability(7) &&
++                    event.device.hello.hasCapability(8)
+                 v2Live = WoonaV2LiveSession(event.device.streams)
+                 v2LiveReceiver = WoonaV2StreamDecoder()
+                 listener.onV2DiscoveryReady(event.device)
+@@ -1157,6 +1256,8 @@ class BleSessionManager(
+     private fun startNextV2Frame(gatt: BluetoothGatt) {
+         if (v2Failed || manualDisconnectRequested || !v2Requested || v2GattWrites.isBusy || !isCurrentGatt(gatt)) return
+         if (v2PendingFrames.isEmpty()) {
++            if (v2StorageExpectedResponse != 0 || v2StorageTransferActive)
++                armV2StorageTimeout(gatt)
+             val phase = v2Discovery?.phase
+             val livePhase = v2Live?.phase
+             if (phase in setOf(
+@@ -1213,6 +1314,11 @@ class BleSessionManager(
+     private fun failV2Discovery(reason: String) {
+         if (v2Failed) return
+         v2Failed = true
++        val storageWasActive = v2StorageExpectedResponse != 0 || v2StorageTransferActive
++        cancelV2StorageTimeout()
++        v2StorageExpectedResponse = 0
++        v2StorageTransferActive = false
++        if (storageWasActive) listener.onV2StorageFailure(reason)
+         v2PendingFrames.clear()
+         v2GattWrites.reset()
+         cancelV2ResponseTimeout()
+@@ -1226,6 +1332,10 @@ class BleSessionManager(
+     private fun resetV2OnDisconnect() {
+         v2ConnectionIntent = false
+         v2ReportedRejectedFrames = 0
++        cancelV2StorageTimeout()
++        v2StorageExpectedResponse = 0
++        v2StorageTransferActive = false
++        v2SupportsStorage = false
+         cancelV2ResponseTimeout()
+         cancelV2ChunkTimeout()
+         v2GattWrites.reset()
+diff --git a/android/app/src/main/java/com/example/myapplication/feature/device/DeviceFeatureController.kt b/android/app/src/main/java/com/example/myapplication/feature/device/DeviceFeatureController.kt
+index ebf27a5..c7eda39 100644
+--- a/android/app/src/main/java/com/example/myapplication/feature/device/DeviceFeatureController.kt
++++ b/android/app/src/main/java/com/example/myapplication/feature/device/DeviceFeatureController.kt
+@@ -1,6 +1,8 @@
+ package com.example.myapplication.feature.device
+ 
+ import android.content.Context
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.setValue
+ import android.content.Intent
+ import android.os.SystemClock
+ import android.util.Log
+@@ -25,6 +27,10 @@ import com.example.myapplication.data.monotonicOffsetNs
+ import com.example.myapplication.data.toJson
+ import com.example.myapplication.localization.EnglishTextResolver
+ import com.example.myapplication.localization.TextResolver
++import com.example.myapplication.protocol.V2Frame
++import com.example.myapplication.protocol.WoonaV2StorageCodec
++import com.example.myapplication.storage.V2StoredRecordStore
++import com.example.myapplication.storage.V2StorageTransferCoordinator
+ import com.example.myapplication.protocol.ConnectionQuality
+ import com.example.myapplication.protocol.ConnectionQualitySnapshot
+ import com.example.myapplication.protocol.ConnectionQualityTracker
+@@ -64,6 +70,7 @@ class DeviceFeatureController(
+     private val runOnUiThread: (() -> Unit) -> Unit = { action -> action() },
+     private val woonaDatabase: WoonaDatabase? = null,
+     private val snapshotDirectory: File? = null,
++    private val v2StorageRootDir: File? = null,
+     private val onRecordingChanged: () -> Unit = {},
+     private val videoRecorder: AndroidVideoRecorder? = null,
+     private val polarSessionManager: PolarSessionManager? = null,
+@@ -75,6 +82,96 @@ class DeviceFeatureController(
+     private val onRecoveryRetryNeeded: () -> Unit = {},
+     onCaptureLifecycleChanged: (Boolean) -> Unit = {},
+ ) : AutoCloseable {
++    // Storage commands, decoded records and fsync share the same serialized IO worker.
++    private val v2StorageWorker = Executors.newSingleThreadExecutor { r ->
++        Thread(r, "v2-storage-io").apply { isDaemon = true }
++    }
++    private val v2StorageEpoch = AtomicLong(0L)
++    @Volatile private var v2StorageAddress: String? = null
++    private var v2StorageCoordinator: V2StorageTransferCoordinator? = null
++    private var v2StorageStateValue by androidx.compose.runtime.mutableStateOf(V2StorageUiState())
++    val v2StorageState: V2StorageUiState get() = v2StorageStateValue
++
++    private fun publishV2Storage(epoch: Long, state: V2StorageTransferCoordinator.Snapshot) {
++        runOnUiThread {
++            if (epoch == v2StorageEpoch.get()) {
++                v2StorageStateValue = v2StorageStateValue.copy(
++                    busy = state.busy, sessions = state.sessions,
++                    downloadingSession = state.downloading,
++                    savedRecords = state.savedRecords, totalRecords = state.totalRecords,
++                    completed = state.completed, error = state.error)
++            }
++        }
++    }
++
++    /** Only call on v2StorageWorker, never the BLE callback thread. */
++    private fun ensureV2Storage(epoch: Long): V2StorageTransferCoordinator {
++        v2StorageCoordinator?.let { return it }
++        val identity = requireNotNull(v2StorageAddress) { "BLE device address unavailable" }
++        val root = requireNotNull(v2StorageRootDir) { "Persistent SD storage directory unavailable" }
++        val store = V2StoredRecordStore(root, identity)
++        return V2StorageTransferCoordinator(
++            sendRequest = { type, payload ->
++                if (epoch != v2StorageEpoch.get() ||
++                    !bleSessionController.sendV2StorageCommand(type, payload))
++                    error("BLE V2 Storage command rejected")
++            },
++            firstMissing = store::firstMissingRecord,
++            persist = { store.save(it) },
++            onUpdate = { publishV2Storage(epoch, it) },
++        ).also { v2StorageCoordinator = it }
++    }
++
++    private fun canUseV2Storage() = v2PreviewConnection && uiState.v2Ready &&
++        uiState.v2DeviceSessionMode == 0 && !uiState.v2LiveRunning &&
++        (uiState.v2Capabilities and ((1L shl 7) or (1L shl 8))) ==
++            ((1L shl 7) or (1L shl 8))
++
++    private fun storageAction(action: (V2StorageTransferCoordinator) -> Unit) {
++        if (!canUseV2Storage() || v2StorageWorker.isShutdown) return
++        val epoch = v2StorageEpoch.get()
++        v2StorageWorker.execute {
++            if (epoch != v2StorageEpoch.get()) return@execute
++            try { action(ensureV2Storage(epoch)) }
++            catch (error: Exception) {
++                runOnUiThread {
++                    if (epoch == v2StorageEpoch.get())
++                        v2StorageStateValue = v2StorageStateValue.copy(busy = false,
++                            downloadingSession = null, error = error.message ?: "V2 Storage error")
++                }
++            }
++        }
++    }
++
++    fun onV2StorageRefreshRequested() = storageAction { it.refresh() }
++    fun onV2StorageDownloadRequested(sequence: Long) = storageAction { it.download(sequence) }
++    fun onV2StorageStopRequested() = storageAction { it.stop() }
++
++    fun onV2StorageFrame(frame: V2Frame) {
++        val epoch = v2StorageEpoch.get()
++        if (!v2StorageWorker.isShutdown) v2StorageWorker.execute {
++            if (epoch == v2StorageEpoch.get()) v2StorageCoordinator?.onFrame(frame)
++        }
++    }
++
++    fun onV2StorageFailure(reason: String) {
++        val epoch = v2StorageEpoch.get()
++        if (!v2StorageWorker.isShutdown) v2StorageWorker.execute {
++            if (epoch == v2StorageEpoch.get())
++                v2StorageCoordinator?.interrupted(reason)
++        }
++    }
++
++    private fun resetV2Storage(reason: String?) {
++        v2StorageEpoch.incrementAndGet()
++        if (!v2StorageWorker.isShutdown) v2StorageWorker.execute {
++            v2StorageCoordinator = null
++        }
++        runOnUiThread {
++            v2StorageStateValue = V2StorageUiState(error = reason)
++        }
++    }
++
+     @Volatile
+     private var recordingChangedListener: () -> Unit = onRecordingChanged
+     @Volatile
+@@ -224,6 +321,8 @@ class DeviceFeatureController(
+         pendingTransportDiagnostics.clear()
+         awaitingCaptureReady = false
+         packetCaptureController.stopCapture()
++        resetV2Storage(null)
++        v2StorageAddress = address
+         v2PreviewConnection = true
+         v2PreviewForeground = true
+         uiStateHolder.onV2PreviewConnecting()
+@@ -623,6 +722,8 @@ class DeviceFeatureController(
+     }
+ 
+     fun onBleStateChanged(state: BleSessionState) {
++        if (state == BleSessionState.DISCONNECTED || state == BleSessionState.FAILED)
++            resetV2Storage("BLE disconnected тАФ resume the transfer after reconnecting")
+         if (v2PreviewConnection) {
+             uiStateHolder.onSessionStateChanged(state)
+             if (state == BleSessionState.FAILED) {
+@@ -817,6 +918,8 @@ class DeviceFeatureController(
+         }
+         deleteSnapshotFiles(staleSnapshot)
+         bleSessionController.close()
++        v2StorageEpoch.incrementAndGet()
++        v2StorageWorker.shutdownNow()
+         polarSessionManager?.close()
+         try { polarFileStore?.close() }
+         catch (error: PolarPersistenceException) { Log.e("WOONA_CAPTURE", "Polar file closure previously failed", error) }
+diff --git a/android/app/src/main/java/com/example/myapplication/feature/device/V2StorageScreen.kt b/android/app/src/main/java/com/example/myapplication/feature/device/V2StorageScreen.kt
+index e80c6cd..e5e33dd 100644
+--- a/android/app/src/main/java/com/example/myapplication/feature/device/V2StorageScreen.kt
++++ b/android/app/src/main/java/com/example/myapplication/feature/device/V2StorageScreen.kt
+@@ -30,6 +30,7 @@ data class V2StorageUiState(
+     val downloadingSession: Long? = null,
+     val savedRecords: Long = 0,
+     val totalRecords: Long = 0,
++    val completed: Boolean = false,
+     val error: String? = null,
+ )
+ 
+@@ -137,6 +138,8 @@ fun V2StorageScreen(
+                 }
+             }
+         }
++        if (state.completed) item { Text(tr("╨Я╨╡╤А╨╡╨┤╨░╤З╨░ ╨╖╨░╨▓╨╡╤А╤И╨╡╨╜╨░; ╨┤╨░╨╜╨╜╤Л╨╡ ╤Б╨╛╤Е╤А╨░╨╜╨╡╨╜╤Л ╨╜╨░ ╤В╨╡╨╗╨╡╤Д╨╛╨╜╨╡",
++            "Transfer complete; data saved on the phone")) }
+         state.error?.let { message ->
+             item { Text(message, color = MaterialTheme.colorScheme.error) }
+         }
+diff --git a/android/app/src/main/java/com/example/myapplication/protocol/WoonaV2LiveSession.kt b/android/app/src/main/java/com/example/myapplication/protocol/WoonaV2LiveSession.kt
+index 2affcaa..5a568e5 100644
+--- a/android/app/src/main/java/com/example/myapplication/protocol/WoonaV2LiveSession.kt
++++ b/android/app/src/main/java/com/example/myapplication/protocol/WoonaV2LiveSession.kt
+@@ -41,6 +41,15 @@ class WoonaV2LiveSession(private val streams: V2Streams) {
+     private var lastFrameSequence: Long? = null
+     private var pendingWireGap = false
+ 
++    /** Reserves IDs for a STORAGE command on the same negotiated V2 connection. */
++    fun reserveExternalCommandIds(): Pair<Long, Long> {
++        check(phase == Phase.IDLE || phase == Phase.STOPPED) { "LIVE is active" }
++        check(nextRequestId <= U32_MAX && nextSequence <= U32_MAX) {
++            "Reconnect before V2 command ID rollover"
++        }
++        return Pair(nextSequence++, nextRequestId++)
++    }
++
+     fun start(streamMask: Long): Event.Transmit {
+         require(phase == Phase.IDLE || phase == Phase.STOPPED) { "Cannot start LIVE in $phase" }
+         require(streamMask in 1..U32_MAX && (streamMask and streams.streamMask) == streamMask) { "Unsupported stream mask" }
+diff --git a/android/app/src/main/java/com/example/myapplication/storage/V2StorageTransferCoordinator.kt b/android/app/src/main/java/com/example/myapplication/storage/V2StorageTransferCoordinator.kt
+index c30ee4a..f35e880 100644
+--- a/android/app/src/main/java/com/example/myapplication/storage/V2StorageTransferCoordinator.kt
++++ b/android/app/src/main/java/com/example/myapplication/storage/V2StorageTransferCoordinator.kt
+@@ -1,13 +1,13 @@
+ package com.example.myapplication.storage
+ 
+ import com.example.myapplication.protocol.V2Frame
++import com.example.myapplication.protocol.WoonaV2Codec
+ import com.example.myapplication.protocol.WoonaV2StorageCodec
+ 
+ /**
+- * Transport-neutral orchestration for V2 SD catalogue and resumable download.
+- * All methods must run on ONE serialized worker; persist and firstMissing must
+- * execute on an IO worker, never directly on the BLE notification callback.
+- * The caller owns request IDs, response timeouts and BLE frame validation.
++ * Serialized, transport-independent V2 storage state machine.
++ * Invoke every method on the same dedicated IO executor. The BLE callback must
++ * never perform fsync or firstMissing() directly.
+  */
+ class V2StorageTransferCoordinator(
+     private val sendRequest: (type: Int, payload: ByteArray) -> Unit,
+@@ -17,6 +17,7 @@ class V2StorageTransferCoordinator(
+ ) {
+     data class Snapshot(
+         val sessions: List<WoonaV2StorageCodec.Session> = emptyList(),
++        val busy: Boolean = false,
+         val downloading: Long? = null,
+         val savedRecords: Long = 0,
+         val totalRecords: Long = 0,
+@@ -24,88 +25,140 @@ class V2StorageTransferCoordinator(
+         val error: String? = null,
+     )
+ 
++    private enum class Phase { IDLE, CATALOG, WAIT_START, TRANSFERRING, WAIT_STOP }
++    private var phase = Phase.IDLE
+     private var state = Snapshot()
+     private var guard: WoonaV2StorageCodec.PersistedSequenceGuard? = null
+-    private var catalogCursor = 0L
+-    private var waitingForPage = false
+-    private var waitingForStart = false
++    private var cursor = 0L
++    private var cancelAfterStart = false
++    private val maxCatalogPages = 1024
++    private var pageCount = 0
++
+     private fun publish(next: Snapshot) { state = next; onUpdate(next) }
++    private fun transmit(type: Int, payload: ByteArray) {
++        // sendRequest throws if the GATT transport cannot accept the command.
++        sendRequest(type, payload)
++    }
+ 
+-    fun refresh() {
+-        require(state.downloading == null) { "Cannot refresh during download" }
+-        catalogCursor = 0L
+-        waitingForPage = true
+-        publish(Snapshot())
+-        sendRequest(0x07, WoonaV2StorageCodec.listRequest())
++    fun refresh() = protect {
++        check(phase == Phase.IDLE) { "Storage is busy" }
++        phase = Phase.CATALOG
++        cursor = 0L
++        pageCount = 0
++        publish(Snapshot(busy = true))
++        transmit(WoonaV2Codec.GET_STORED_SESSIONS, WoonaV2StorageCodec.listRequest())
+     }
+ 
+-    fun download(sessionSequence: Long) {
+-        require(state.downloading == null && !waitingForPage) { "Storage operation busy" }
+-        val cursor = firstMissing(sessionSequence)
+-        guard = WoonaV2StorageCodec.PersistedSequenceGuard(sessionSequence, cursor)
+-        waitingForStart = true
+-        publish(state.copy(downloading = sessionSequence, savedRecords = cursor,
+-            totalRecords = 0, completed = false, error = null))
+-        sendRequest(0x09, WoonaV2StorageCodec.startTransferRequest(sessionSequence, cursor))
++    fun download(sessionSequence: Long) = protect {
++        check(phase == Phase.IDLE) { "Storage is busy" }
++        require(sessionSequence > 0L)
++        val start = firstMissing(sessionSequence)
++        guard = WoonaV2StorageCodec.PersistedSequenceGuard(sessionSequence, start)
++        phase = Phase.WAIT_START
++        cancelAfterStart = false
++        publish(state.copy(busy = true, downloading = sessionSequence,
++            savedRecords = start, totalRecords = 0, completed = false, error = null))
++        transmit(WoonaV2Codec.START_STORED_TRANSFER,
++            WoonaV2StorageCodec.startTransferRequest(sessionSequence, start))
+     }
+ 
+-    fun stop() {
+-        val session = state.downloading ?: return
+-        sendRequest(0x0A, WoonaV2StorageCodec.stopTransferRequest(session))
+-        guard = null
+-        waitingForStart = false
+-        publish(state.copy(downloading = null))
++    fun stop() = protect {
++        when (phase) {
++            Phase.WAIT_START -> cancelAfterStart = true
++            Phase.TRANSFERRING -> requestStop()
++            else -> Unit
++        }
+     }
+ 
+-    fun onFrame(frame: V2Frame) {
+-        try {
+-            when (frame.type) {
+-                0x87 -> {
+-                    if (!waitingForPage) return
+-                    val page = requireNotNull(WoonaV2StorageCodec.parsePage(frame)) { "Bad SD catalog page" }
+-                    val entries = state.sessions + page.sessions
+-                    if (page.hasMore) {
+-                        require(page.nextBeforeSequence != catalogCursor) { "Non-advancing SD cursor" }
+-                        catalogCursor = page.nextBeforeSequence
+-                        publish(state.copy(sessions = entries))
+-                        sendRequest(0x07, WoonaV2StorageCodec.listRequest(catalogCursor))
+-                    } else {
+-                        waitingForPage = false
+-                        publish(state.copy(sessions = entries))
+-                    }
++    private fun requestStop() {
++        val session = requireNotNull(guard).sessionSequence
++        phase = Phase.WAIT_STOP
++        transmit(WoonaV2Codec.STOP_STORED_TRANSFER,
++            WoonaV2StorageCodec.stopTransferRequest(session))
++    }
++
++    fun onFrame(frame: V2Frame) = protect {
++        when (frame.type) {
++            WoonaV2Codec.ERROR_RESPONSE -> if (phase != Phase.IDLE) {
++                val status = frame.payload.firstOrNull()?.toInt()?.and(0xff)
++                error("Device refused Storage request (status=${status ?: "unknown"})")
++            }
++            WoonaV2StorageCodec.SESSIONS_RESPONSE -> if (phase == Phase.CATALOG) {
++                val page = requireNotNull(WoonaV2StorageCodec.parsePage(frame)) { "Invalid SD catalog response" }
++                val old = state.sessions
++                require(page.sessions.none { entry -> old.any { it.sequence == entry.sequence } }) {
++                    "Repeated SD session in paginated catalog"
++                }
++                val all = old + page.sessions
++                if (page.hasMore) {
++                    check(++pageCount <= maxCatalogPages) { "SD catalog exceeds page limit" }
++                    require(page.nextBeforeSequence != 0L &&
++                        (cursor == 0L || page.nextBeforeSequence < cursor)) { "Invalid SD catalog cursor" }
++                    cursor = page.nextBeforeSequence
++                    publish(state.copy(sessions = all))
++                    transmit(WoonaV2Codec.GET_STORED_SESSIONS,
++                        WoonaV2StorageCodec.listRequest(cursor))
++                } else {
++                    phase = Phase.IDLE
++                    publish(state.copy(sessions = all, busy = false))
++                }
++            }
++            WoonaV2StorageCodec.START_TRANSFER_RESPONSE -> if (phase == Phase.WAIT_START) {
++                val accepted = requireNotNull(WoonaV2StorageCodec.parseTransferAccepted(frame)) {
++                    "Invalid SD transfer acceptance"
+                 }
+-                0x89 -> {
+-                    if (!waitingForStart) return
+-                    val accepted = requireNotNull(WoonaV2StorageCodec.parseTransferAccepted(frame)) { "Bad transfer acceptance" }
+-                    val g = requireNotNull(guard)
+-                    require(accepted.sequence == g.sessionSequence &&
+-                        accepted.startRecordSequence == g.firstMissingRecord) { "Wrong transfer cursor" }
+-                    waitingForStart = false
+-                    publish(state.copy(totalRecords = accepted.totalRecords))
++                val g = requireNotNull(guard)
++                require(accepted.sequence == g.sessionSequence &&
++                    accepted.startRecordSequence == g.firstMissingRecord) { "Unexpected SD resume cursor" }
++                require(accepted.totalRecords >= g.firstMissingRecord) { "Invalid total record count" }
++                phase = Phase.TRANSFERRING
++                publish(state.copy(totalRecords = accepted.totalRecords))
++                if (cancelAfterStart) requestStop()
++            }
++            WoonaV2Codec.STORED_DATA -> if (phase == Phase.TRANSFERRING) {
++                val record = requireNotNull(WoonaV2StorageCodec.parseRecord(frame)) {
++                    "Malformed SD record"
+                 }
+-                0x41 -> {
+-                    if (waitingForStart) return
+-                    val record = requireNotNull(WoonaV2StorageCodec.parseRecord(frame)) { "Bad stored record" }
+-                    val g = guard ?: return
+-                    require(g.isExpected(record)) { "Gap, duplicate or wrong session" }
+-                    persist(frame) // MUST durably fsync before returning
+-                    g.markDurable(record)
+-                    publish(state.copy(savedRecords = g.firstMissingRecord))
++                val g = requireNotNull(guard)
++                require(g.isExpected(record)) { "SD sequence gap or wrong session: got ${record.recordSequence}" }
++                persist(frame) // fsync + atomic replacement, before advancing sequence
++                g.markDurable(record)
++                publish(state.copy(savedRecords = g.firstMissingRecord))
++            }
++            WoonaV2Codec.STORED_TRANSFER_END -> if (phase == Phase.TRANSFERRING) {
++                val end = requireNotNull(WoonaV2StorageCodec.parseTransferEnd(frame)) {
++                    "Malformed SD transfer end"
+                 }
+-                0x42 -> {
+-                    val g = guard ?: return
+-                    val end = requireNotNull(WoonaV2StorageCodec.parseTransferEnd(frame)) { "Bad transfer end" }
+-                    require(g.isComplete(end)) { "Incomplete SD transfer" }
+-                    guard = null
+-                    publish(state.copy(downloading = null, completed = true))
+-                    // Never confirm 0x0B here. Only a verified server receipt can authorize it.
++                val g = requireNotNull(guard)
++                require(g.isComplete(end)) { "Incomplete SD transfer: ${g.firstMissingRecord} persisted" }
++                phase = Phase.IDLE
++                guard = null
++                publish(state.copy(busy = false, downloading = null, completed = true))
++                // Never send CONFIRM_STORED_SESSION (0x0B) without a server receipt.
++            }
++            WoonaV2StorageCodec.STOP_TRANSFER_RESPONSE -> if (phase == Phase.WAIT_STOP) {
++                val p = frame.payload
++                require(p.size == 16 && (p[0].toInt() and 0xff) == 0 &&
++                    java.nio.ByteBuffer.wrap(p).order(java.nio.ByteOrder.LITTLE_ENDIAN).getLong(8) == guard?.sessionSequence) {
++                    "Invalid SD stop acknowledgement"
+                 }
++                phase = Phase.IDLE
++                guard = null
++                cancelAfterStart = false
++                publish(state.copy(busy = false, downloading = null))
+             }
+-        } catch (e: Exception) {
+-            waitingForPage = false
+-            waitingForStart = false
+-            guard = null
+-            publish(state.copy(downloading = null, error = e.message ?: "SD transfer failed"))
+         }
+     }
++
++    fun interrupted(reason: String) {
++        phase = Phase.IDLE
++        guard = null
++        cancelAfterStart = false
++        publish(state.copy(busy = false, downloading = null, completed = false, error = reason))
++    }
++
++    private inline fun protect(block: () -> Unit) {
++        try { block() }
++        catch (e: Exception) { interrupted(e.message ?: "V2 Storage failed") }
++    }
+ }

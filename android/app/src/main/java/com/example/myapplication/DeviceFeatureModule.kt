@@ -266,6 +266,30 @@ fun createDeviceFeatureController(
                 }
             }
 
+            override fun onV2StorageFrame(frame: com.example.myapplication.protocol.V2Frame) {
+                deviceFeatureController?.onV2StorageFrame(frame)
+            }
+
+            override fun onV2StorageFailure(reason: String) {
+                deviceFeatureController?.onV2StorageFailure(reason)
+            }
+
+            override fun onV2TimeSyncStatus(status: com.example.myapplication.protocol.WoonaV2TimeSync.Diagnostics) {
+                v2OnMain { deviceFeatureController?.onV2TimeSyncStatus(status) }
+            }
+
+            override fun onV2SdCaptureStarted(sessionId: Long, storageSeq: Long,
+                                              streamMask: Long, durationSeconds: Int) {
+                v2OnMain { deviceFeatureController?.onV2SdCaptureStarted(
+                    sessionId, storageSeq, streamMask, durationSeconds) }
+            }
+            override fun onV2SdCaptureStopped(sessionId: Long, storageSeq: Long) {
+                v2OnMain { deviceFeatureController?.onV2SdCaptureStopped(sessionId, storageSeq) }
+            }
+            override fun onV2SdCaptureFailure(message: String) {
+                v2OnMain { deviceFeatureController?.onV2SdCaptureFailure(message) }
+            }
+
             override fun onV2FrameRejections(total: Long) {
                 if (deviceFeatureController?.isV2PreviewForeground() != true) return
                 val schedule = synchronized(v2PreviewLock) {
@@ -430,6 +454,7 @@ fun createDeviceFeatureController(
         },
         woonaDatabase = woonaDatabase,
         snapshotDirectory = snapshotDirectory,
+        v2StorageRootDir = filesDir,
         onRecordingChanged = onRecordingChanged,
         videoRecorder = AndroidVideoRecorder(context),
         polarSessionManager = polarSessionManager,

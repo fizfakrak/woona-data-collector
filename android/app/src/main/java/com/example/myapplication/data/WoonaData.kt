@@ -1449,7 +1449,11 @@ class WoonaDatabase(
                         else -> "unavailable"
                     },
                 )
-                put("sensor_clock_quality", if (metadata.sensor == null) "unavailable" else "first_packet_arrival")
+                put("sensor_clock_quality", when {
+                    metadata.sensor == null -> "unavailable"
+                    metadata.sensor.event == "v2_time_sync" -> "calibrated"
+                    else -> "first_packet_arrival"
+                })
                 put("overall_sync_quality", metadata.video?.synchronizationQuality ?: "unavailable")
                 put("updated_at_utc", now.toString())
             },

@@ -41,6 +41,15 @@ class WoonaV2LiveSession(private val streams: V2Streams) {
     private var lastFrameSequence: Long? = null
     private var pendingWireGap = false
 
+    /** Reserves IDs for a STORAGE command on the same negotiated V2 connection. */
+    fun reserveExternalCommandIds(): Pair<Long, Long> {
+        check(phase == Phase.IDLE || phase == Phase.STOPPED) { "LIVE is active" }
+        check(nextRequestId <= U32_MAX && nextSequence <= U32_MAX) {
+            "Reconnect before V2 command ID rollover"
+        }
+        return Pair(nextSequence++, nextRequestId++)
+    }
+
     fun start(streamMask: Long): Event.Transmit {
         require(phase == Phase.IDLE || phase == Phase.STOPPED) { "Cannot start LIVE in $phase" }
         require(streamMask in 1..U32_MAX && (streamMask and streams.streamMask) == streamMask) { "Unsupported stream mask" }

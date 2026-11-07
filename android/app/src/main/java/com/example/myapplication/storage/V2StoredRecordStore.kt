@@ -29,6 +29,30 @@ class V2StoredRecordStore(root: File, deviceIdentity: String) {
         require(sessionSequence > 0L)
         return File(directory, "session-$sessionSequence")
     }
+    data class LocalSession(val sequence: Long, val records: Int,
+                            val hasVideo: Boolean, val hasTimeSync: Boolean)
+
+    /** Scan app-private files; never delete already downloaded V2 records. */
+    fun localSessions(): List<LocalSession> {
+        val files = directory.listFiles().orEmpty()
+        return files.mapNotNull { item ->
+            if (!item.isDirectory) return@mapNotNull null
+            val seq = item.name.removePrefix("session-").takeIf {
+                item.name.startsWith("session-") && it.matches(Regex("[0-9]+"))
+            }?.toLongOrNull()?.takeIf { it > 0L } ?: return@mapNotNull null
+            val records = item.listFiles().orEmpty().count { file ->
+                file.isFile && file.name.matches(Regex("record-[0-9]{10}\\.frame"))
+            }
+            LocalSession(seq, records, File(item,"video.mp4").let { it.isFile && it.length()>0L },
+                File(item,"time-sync.json").isFile)
+        }.sortedByDescending { it.sequence }
+    }
+
+    /** Shared media/record directory keyed by the same BLE identity and durable session sequence. */
+    fun mediaDirectory(sessionSequence: Long): File = sessionDir(sessionSequence).also {
+        Files.createDirectories(it.toPath())
+    }
+
     private fun recordFile(sessionSequence: Long, recordSequence: Long): File {
         require(recordSequence in 0..0xffff_ffffL)
         return File(sessionDir(sessionSequence), "record-${recordSequence.toString().padStart(10, '0')}.frame")
@@ -44,7 +68,8 @@ class V2StoredRecordStore(root: File, deviceIdentity: String) {
         val record = requireNotNull(WoonaV2StorageCodec.parseRecord(frame)) { "Invalid stored V2 record" }
         val raw = WoonaV2Codec.encodeRaw(frame.type, frame.sequence, frame.requestId, frame.payload, frame.flags)
         val target = recordFile(record.sessionSequence, record.recordSequence)
-        Files.createDirectories(target.parentFile.toPath())
+        val targetDirectory = requireNotNull(target.parentFile) { "Stored record has no parent directory" }
+        Files.createDirectories(targetDirectory.toPath())
         if (target.exists()) {
             val previous = readValidated(target, record.sessionSequence, record.recordSequence)
             require(previous.samples.contentEquals(record.samples) &&
@@ -57,7 +82,7 @@ class V2StoredRecordStore(root: File, deviceIdentity: String) {
             }
             return record
         }
-        val tmp = File.createTempFile(".pending-", ".tmp", target.parentFile)
+        val tmp = File.createTempFile(".pending-", ".tmp", targetDirectory)
         try {
             FileOutputStream(tmp).use { output ->
                 output.write(raw)

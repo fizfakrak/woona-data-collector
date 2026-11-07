@@ -19,6 +19,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.example.myapplication.localization.AppLanguage
 import com.example.myapplication.protocol.WoonaV2StorageCodec
+import com.example.myapplication.protocol.WoonaV2TimeSync
 
 /** This UI renders state only. No BLE, file or server work is performed in Compose. */
 data class V2StorageUiState(
@@ -27,9 +28,23 @@ data class V2StorageUiState(
     val storageSupported: Boolean = false,
     val busy: Boolean = false,
     val sessions: List<WoonaV2StorageCodec.Session> = emptyList(),
+    val localSessions: List<com.example.myapplication.storage.V2StoredRecordStore.LocalSession> = emptyList(),
     val downloadingSession: Long? = null,
     val savedRecords: Long = 0,
     val totalRecords: Long = 0,
+    val completed: Boolean = false,
+    val error: String? = null,
+)
+
+data class V2SdCaptureUiState(
+    val phase: String = "idle", // syncing / starting / recording / stopping / completed / failed
+    val busy: Boolean = false,
+    val running: Boolean = false,
+    val sessionSequence: Long? = null,
+    val durationSeconds: Int = 120,
+    val elapsedSeconds: Long = 0,
+    val videoEnabled: Boolean = true,
+    val videoStatus: String = "",
     val error: String? = null,
 )
 
@@ -37,6 +52,9 @@ data class V2StorageUiState(
 data class V2StorageActions(
     val refresh: (() -> Unit)? = null,
     val startOnDevice: (() -> Unit)? = null,
+    val stopOnDevice: (() -> Unit)? = null,
+    val durationChanged: ((Int) -> Unit)? = null,
+    val videoChanged: ((Boolean) -> Unit)? = null,
     val download: ((Long) -> Unit)? = null,
     val stopTransfer: (() -> Unit)? = null,
 )
@@ -46,14 +64,57 @@ fun V2StorageScreen(
     state: V2StorageUiState,
     language: AppLanguage,
     actions: V2StorageActions = V2StorageActions(),
+    timeSync: WoonaV2TimeSync.Diagnostics = WoonaV2TimeSync.Diagnostics(),
+    timeSyncSupported: Boolean = false,
+    onTimeSync: (() -> Unit)? = null,
+    sdCapture: V2SdCaptureUiState = V2SdCaptureUiState(),
 ) {
     val ru = language == AppLanguage.RUSSIAN
     fun tr(ruText: String, enText: String) = if (ru) ruText else enText
-    val available = state.connected && state.v2Ready && state.storageSupported && !state.busy
+    val available = state.connected && state.v2Ready && state.storageSupported && !state.busy && !sdCapture.busy && !sdCapture.running
     LazyColumn(
         modifier = Modifier.padding(horizontal = 12.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
+        item {
+            Card(Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(tr("Синхронизация времени (тест F405)", "Time sync (F405 test)"),
+                         style = MaterialTheme.typography.titleMedium)
+                    Text(tr("Проверка 7 обменов с контроллером по BLE V2.",
+                        "Seven BLE V2 clock exchanges with the controller."),
+                        style = MaterialTheme.typography.bodySmall)
+                    Button(onClick = { onTimeSync?.invoke() },
+                        enabled = state.connected && state.v2Ready && timeSyncSupported &&
+                            !timeSync.running && !state.busy && !sdCapture.busy && !sdCapture.running && onTimeSync != null) {
+                        Text(tr("Проверить часы", "Check clocks"))
+                    }
+                    if (timeSync.running) Text("${timeSync.collected} / ${timeSync.total}")
+                    if (!timeSyncSupported) Text(tr("Прошивка не объявляет TIME_SYNC (bit 11)",
+                        "Firmware does not advertise TIME_SYNC (bit 11)"))
+                    timeSync.bestRttMs?.let { rtt ->
+                        Text(String.format(java.util.Locale.US,
+                            "RTT %.2f ms · ±%.2f ms", rtt, timeSync.uncertaintyMs ?: 0.0))
+                    }
+                    timeSync.offsetMs?.let { offset ->
+                        Text(String.format(java.util.Locale.US, "Android − STM32: %.2f ms", offset))
+                    }
+                    if (!timeSync.running && timeSync.collected == timeSync.total &&
+                        timeSync.bestRttMs != null)
+                        Text(tr("Синхронизация завершена", "Sync completed"))
+                    timeSync.clockEpochId?.let { epoch ->
+                        Text("Clock epoch: 0x" + epoch.toULong().toString(16),
+                            style = MaterialTheme.typography.bodySmall)
+                    }
+                    timeSync.error?.let { error ->
+                        Text(error, color = MaterialTheme.colorScheme.error)
+                    }
+                    Text(tr("Проверка транспорта, не калибровка часов или видео.",
+                        "Transport check, not yet video alignment."),
+                        style = MaterialTheme.typography.bodySmall)
+                }
+            }
+        }
         item {
             Card(Modifier.fillMaxWidth()) {
                 Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -76,13 +137,34 @@ fun V2StorageScreen(
                             enabled = available && actions.refresh != null) {
                             Text(tr("Обновить SD", "Refresh SD"))
                         }
-                        Button(onClick = { actions.startOnDevice?.invoke() },
-                            enabled = available && actions.startOnDevice != null) {
-                            Text(tr("Записать на SD", "Record to SD"))
-                        }
+                        Text(tr("Запуск записи: Сессия → Основное → Новое подключение → SD-запись",
+                            "Start capture: Session → Overview → New connection → SD recording"),
+                            style=MaterialTheme.typography.bodySmall)
                     }
+                    if (sdCapture.running) Text(tr("Время записи: ", "Recording time: ") +
+                        "${sdCapture.elapsedSeconds} / ${sdCapture.durationSeconds} s")
+                    if (sdCapture.videoStatus.isNotBlank()) Text(sdCapture.videoStatus)
+                    sdCapture.error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
                 }
             }
+        }
+        item {
+            Text(tr("Сохранено на этом телефоне", "Saved on this phone"),
+                style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+        }
+        if (state.localSessions.isEmpty()) item {
+            Text(tr("Пока нет загруженных записей. Записи на SD и в памяти телефона независимы.",
+                "No downloaded sessions yet. Device SD and phone storage are independent."))
+        }
+        items(state.localSessions, key = { "local-"+it.sequence }) { local ->
+            Card(Modifier.fillMaxWidth()) { Column(Modifier.padding(12.dp)) {
+                Text("#${local.sequence} · ${local.records} " + tr("блоков", "records"))
+                Text(tr("Видео: ", "Video: ") + (if (local.hasVideo) "✓" else "—"))
+                Text("TIME_SYNC: " + (if (local.hasTimeSync) "✓" else "—"))
+                Text(tr("Файлы сохранены в памяти приложения, а не в общей папке загрузок.",
+                    "Files are in app-private storage, not Downloads."),
+                    style=MaterialTheme.typography.bodySmall)
+            } }
         }
         item {
             Text(tr("Сессии на датчике", "Sessions on device"),
@@ -137,6 +219,8 @@ fun V2StorageScreen(
                 }
             }
         }
+        if (state.completed) item { Text(tr("Передача завершена; данные сохранены на телефоне",
+            "Transfer complete; data saved on the phone")) }
         state.error?.let { message ->
             item { Text(message, color = MaterialTheme.colorScheme.error) }
         }
